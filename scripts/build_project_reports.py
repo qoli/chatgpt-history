@@ -935,6 +935,160 @@ def render_project_knowledge_entries(
     return lines
 
 
+def parse_iso_datetime(value: str) -> Optional[datetime]:
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    try:
+        return datetime.fromisoformat(cleaned.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def build_topic_label_map(topic_payloads: Sequence[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    mapping: Dict[str, List[Dict[str, Any]]] = {}
+    for topic in topic_payloads:
+        label = str(topic.get("label") or "").strip()
+        if not label:
+            continue
+        mapping.setdefault(label, []).append(topic)
+    return mapping
+
+
+def topic_latest_timestamp(topic: Dict[str, Any]) -> str:
+    best: Optional[datetime] = None
+    best_value = ""
+    for member in topic.get("members") or []:
+        value = str(member.get("update_time") or "").strip()
+        parsed = parse_iso_datetime(value)
+        if parsed is None:
+            continue
+        if best is None or parsed > best:
+            best = parsed
+            best_value = value
+    return best_value
+
+
+def build_timeline_entries(
+    project_knowledge: Dict[str, Any],
+    topic_payloads: Sequence[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    topic_map = build_topic_label_map(topic_payloads)
+    category_specs = [
+        ("architectural_ideas", "architecture", "idea"),
+        ("engineering_decisions", "decision", "decision"),
+        ("recurring_patterns", "pattern", "pattern"),
+        ("open_questions", "open_question", "question"),
+        ("concepts", "concept", "name"),
+    ]
+
+    entries: List[Dict[str, Any]] = []
+    seen = set()
+    for field_name, entry_type, value_key in category_specs:
+        for item in project_knowledge.get(field_name) or []:
+            title = str(item.get(value_key) or "").strip()
+            if not title:
+                continue
+            supporting_topics = [str(value).strip() for value in item.get("supporting_topics") or [] if str(value).strip()]
+            if entry_type == "concept" and len(supporting_topics) < 2:
+                continue
+            supporting_payloads = [payload for label in supporting_topics for payload in topic_map.get(label, [])]
+            timestamp = ""
+            timestamp_dt: Optional[datetime] = None
+            for payload in supporting_payloads:
+                value = topic_latest_timestamp(payload)
+                parsed = parse_iso_datetime(value)
+                if parsed is None:
+                    continue
+                if timestamp_dt is None or parsed > timestamp_dt:
+                    timestamp_dt = parsed
+                    timestamp = value
+
+            source_conversations: List[Dict[str, Any]] = []
+            evidence_concepts = unique_preserving_order(
+                concept
+                for payload in supporting_payloads
+                for concept in (payload.get("evidence_concepts") or [])
+            )[:4]
+            source_seen = set()
+            for payload in supporting_payloads:
+                for member in payload.get("members") or []:
+                    source_key = (member.get("conversation_id"), member.get("source_path"))
+                    if source_key in source_seen:
+                        continue
+                    source_seen.add(source_key)
+                    source_conversations.append(
+                        {
+                            "conversation_id": member.get("conversation_id"),
+                            "title": member.get("title"),
+                            "source_path": member.get("source_path"),
+                            "update_time": member.get("update_time"),
+                        }
+                    )
+
+            dedupe_key = (entry_type, title.casefold(), tuple(sorted(supporting_topics)))
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            entries.append(
+                {
+                    "timestamp": timestamp,
+                    "type": entry_type,
+                    "topic": supporting_topics[0] if supporting_topics else "",
+                    "title": title,
+                    "supporting_topics": supporting_topics,
+                    "source_conversations": source_conversations,
+                    "supporting_chunk_evidence": evidence_concepts,
+                }
+            )
+
+    def sort_key(item: Dict[str, Any]) -> tuple[float, int, str]:
+        parsed = parse_iso_datetime(str(item.get("timestamp") or ""))
+        ts = parsed.timestamp() if parsed is not None else 0.0
+        type_rank = {"architecture": 0, "decision": 1, "pattern": 2, "open_question": 3, "concept": 4}.get(str(item.get("type") or ""), 5)
+        return (ts, type_rank, str(item.get("title") or "").casefold())
+
+    return sorted(entries, key=sort_key)
+
+
+def render_timeline_section(timeline_entries: Sequence[Dict[str, Any]], max_entries: int = 12) -> List[str]:
+    lines = ["## Key Timeline", ""]
+    if not timeline_entries:
+        lines.extend(["_No timeline events were generated._", ""])
+        return lines
+
+    limited_entries = list(timeline_entries[:max_entries])
+    current_date = ""
+    for entry in limited_entries:
+        timestamp = str(entry.get("timestamp") or "").strip()
+        date_label = timestamp[:10] if len(timestamp) >= 10 else "Unknown Date"
+        if date_label != current_date:
+            if current_date:
+                lines.append("")
+            current_date = date_label
+            lines.append(f"### {date_label}")
+        type_label = str(entry.get("type") or "event").replace("_", " ").title()
+        title = str(entry.get("title") or "").strip()
+        support = ", ".join(str(item) for item in entry.get("supporting_topics") or [])
+        source_titles = ", ".join(
+            str(item.get("title") or "Untitled")
+            for item in (entry.get("source_conversations") or [])[:3]
+        )
+        line = f"- **{type_label}**: {title}"
+        if support:
+            line += f" Topics: {support}"
+        if source_titles:
+            line += f" Sources: {source_titles}"
+        lines.append(line)
+        evidence = list(entry.get("supporting_chunk_evidence") or [])[:2]
+        if evidence:
+            lines.append(f"  Evidence: {'; '.join(evidence)}")
+    if len(timeline_entries) > max_entries:
+        lines.extend(["", f"_Showing {max_entries} of {len(timeline_entries)} timeline events._"])
+    lines.append("")
+    return lines
+
+
 def render_topic_map(topic_payloads: Sequence[Dict[str, Any]]) -> List[str]:
     lines = ["## Topic Map", ""]
     if not topic_payloads:
@@ -963,6 +1117,7 @@ def render_project_report_markdown(
     project_name: str,
     project_knowledge: Dict[str, Any],
     topic_payloads: Sequence[Dict[str, Any]],
+    timeline_entries: Sequence[Dict[str, Any]],
     conversations: Sequence[ConversationRecord],
 ) -> str:
     lines = [
@@ -977,6 +1132,7 @@ def render_project_report_markdown(
     lines.extend(render_project_knowledge_entries("## Engineering Decisions", project_knowledge.get("engineering_decisions") or [], "decision"))
     lines.extend(render_project_knowledge_entries("## Recurring Patterns", project_knowledge.get("recurring_patterns") or [], "pattern"))
     lines.extend(render_project_knowledge_entries("## Open Questions", project_knowledge.get("open_questions") or [], "question"))
+    lines.extend(render_timeline_section(timeline_entries))
     lines.extend(render_topic_map(topic_payloads))
     return "\n".join(lines).rstrip() + "\n\n" + build_conversation_index_section(conversations)
 
@@ -1316,9 +1472,11 @@ def run_pipeline(args: argparse.Namespace) -> int:
         chunk_clusters_path = project_dir / "chunk_clusters.json"
         chunk_links_path = project_dir / "chunk_to_session_cluster_links.json"
         project_knowledge_path = project_dir / "project_knowledge.json"
+        timeline_path = project_dir / "timeline.json"
         report_path = project_dir / "project_report.md"
 
         if args.report_only:
+            timeline_entries: List[Dict[str, Any]] = []
             if project_knowledge_path.exists():
                 project_knowledge = json.loads(project_knowledge_path.read_text(encoding="utf-8"))
                 topic_payloads = []
@@ -1335,7 +1493,15 @@ def run_pipeline(args: argparse.Namespace) -> int:
                     f"Cannot rebuild report for {project_name}: missing {project_knowledge_path.name} and {session_clusters_path.name}."
                 )
 
-            report_markdown = render_project_report_markdown(project_name, project_knowledge, topic_payloads, conversations)
+            if timeline_path.exists():
+                payload = json.loads(timeline_path.read_text(encoding="utf-8"))
+                if isinstance(payload, list):
+                    timeline_entries = payload
+            else:
+                timeline_entries = build_timeline_entries(project_knowledge, topic_payloads)
+                write_json(timeline_path, timeline_entries)
+
+            report_markdown = render_project_report_markdown(project_name, project_knowledge, topic_payloads, timeline_entries, conversations)
             write_text(report_path, report_markdown)
             continue
 
@@ -1444,8 +1610,10 @@ def run_pipeline(args: argparse.Namespace) -> int:
             except PipelineError:
                 project_knowledge = build_fallback_project_knowledge(project_name, conversations, cluster_payloads)
         write_json(project_knowledge_path, project_knowledge)
+        timeline_entries = build_timeline_entries(project_knowledge, cluster_payloads)
+        write_json(timeline_path, timeline_entries)
 
-        report_markdown = render_project_report_markdown(project_name, project_knowledge, cluster_payloads, conversations)
+        report_markdown = render_project_report_markdown(project_name, project_knowledge, cluster_payloads, timeline_entries, conversations)
         write_text(report_path, report_markdown)
 
     index_path = output_dir / "index.md"
