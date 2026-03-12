@@ -35,6 +35,7 @@ FIELD_RE = re.compile(r"^([A-Za-z0-9_]+):\s*(.+?)\s*$")
 UNSAFE_FILENAME_RE = re.compile(r'[\\/:*?"<>|]+')
 DISALLOWED_FILENAME_CHAR_RE = re.compile(r"[^0-9A-Za-z_\-\u3400-\u4dbf\u4e00-\u9fff]+")
 UNDERSCORE_RUN_RE = re.compile(r"_+")
+MESSAGE_SECTION_RE = re.compile(r"^## (\d+)\. ([A-Za-z]+)\s*$", re.MULTILINE)
 REQUIRED_REPORT_HEADERS = [
     "## Project Overview",
     "## Core Themes",
@@ -60,6 +61,13 @@ class ConversationRecord:
     source_path: Path
 
 
+@dataclass
+class ConversationMessage:
+    index: int
+    role: str
+    content: str
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build one report per ChatGPT project.")
     parser.add_argument("--input-dir", default=str(DEFAULT_INPUT_DIR), help="Directory containing exported markdown.")
@@ -81,6 +89,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.72,
         help="Cosine similarity threshold used for greedy per-project clustering.",
+    )
+    parser.add_argument(
+        "--chunk-cluster-threshold",
+        type=float,
+        default=None,
+        help="Optional cosine similarity threshold for A/B chunk clustering. Defaults to --cluster-threshold.",
     )
     parser.add_argument(
         "--summary-max-chars",
@@ -197,6 +211,78 @@ def truncate_for_summary(text: str, max_chars: int) -> str:
     head = text[: max_chars // 2]
     tail = text[-max_chars // 2 :]
     return f"{head}\n\n[... truncated ...]\n\n{tail}"
+
+
+def parse_markdown_messages(body: str) -> List[ConversationMessage]:
+    matches = list(MESSAGE_SECTION_RE.finditer(body))
+    messages: List[ConversationMessage] = []
+    for index, match in enumerate(matches):
+        content_start = match.end()
+        content_end = matches[index + 1].start() if index + 1 < len(matches) else len(body)
+        content = body[content_start:content_end].strip()
+        if not content:
+            continue
+        messages.append(
+            ConversationMessage(
+                index=int(match.group(1)),
+                role=match.group(2).strip().casefold(),
+                content=content,
+            )
+        )
+    return messages
+
+
+def normalize_chunk_text(user_text: str, assistant_text: str) -> str:
+    return f"Question:\n{user_text.strip()}\n\nAnswer:\n{assistant_text.strip()}".strip()
+
+
+def build_ab_chunks(record: ConversationRecord) -> List[Dict[str, Any]]:
+    messages = parse_markdown_messages(record.body)
+    chunks: List[Dict[str, Any]] = []
+    pending_user_parts: List[str] = []
+    pending_user_indices: List[int] = []
+    conversation_key = record.conversation_id or sanitize_filename(record.title)
+
+    for message in messages:
+        if message.role == "user":
+            pending_user_parts.append(message.content.strip())
+            pending_user_indices.append(message.index)
+            continue
+        if message.role != "assistant":
+            continue
+
+        if not pending_user_parts:
+            continue
+
+        user_text = "\n\n".join(part for part in pending_user_parts if part).strip()
+        assistant_text = message.content.strip()
+        pending_user_parts = []
+        user_indices = pending_user_indices
+        pending_user_indices = []
+        if not user_text or not assistant_text:
+            continue
+
+        turn_id = len(chunks) + 1
+        chunks.append(
+            {
+                "project": record.project,
+                "conversation_id": record.conversation_id,
+                "conversation_title": record.title,
+                "chunk_id": f"{conversation_key}-turn-{turn_id:03d}",
+                "turn_id": turn_id,
+                "message_indices": user_indices + [message.index],
+                "user": user_text,
+                "assistant": assistant_text,
+                "normalized_text": normalize_chunk_text(user_text, assistant_text),
+                "is_incomplete": False,
+                "create_time": record.create_time,
+                "update_time": record.update_time,
+                "source_path": str(record.source_path.relative_to(PROJECT_DIR)),
+                "source_url": record.source_url,
+            }
+        )
+
+    return chunks
 
 
 def request_json(url: str, payload: Dict[str, Any], headers: Dict[str, str], timeout: int = 600) -> Dict[str, Any]:
@@ -630,6 +716,13 @@ def unique_preserving_order(items: Iterable[str]) -> List[str]:
     return result
 
 
+def short_text(value: str, limit: int = 160) -> str:
+    compact = " ".join(value.split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: max(limit - 3, 1)].rstrip() + "..."
+
+
 def extract_report_markdown(text: str, project_name: str) -> str:
     cleaned = text.strip()
     start_marker = f"# {project_name} Report"
@@ -723,6 +816,98 @@ def embedding_text(summary: Dict[str, Any]) -> str:
         "; ".join(str(item) for item in summary.get("open_questions") or []),
     ]
     return "\n".join(section for section in sections if section).strip()
+
+
+def build_attachment_confidence(vote_count: int, total_count: int, similarity: float, tied: bool) -> str:
+    vote_ratio = (vote_count / total_count) if total_count else 0.0
+    if not tied and vote_ratio >= 0.75 and similarity >= 0.65:
+        return "high"
+    if vote_ratio >= 0.5 and similarity >= 0.5:
+        return "medium"
+    return "low"
+
+
+def build_chunk_cluster_artifacts(
+    chunks: Sequence[Dict[str, Any]],
+    chunk_vectors: Sequence[Sequence[float]],
+    chunk_clusters: Sequence[Dict[str, Any]],
+    conversation_to_session_cluster: Dict[str, str],
+    session_cluster_centroids: Dict[str, Sequence[float]],
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    cluster_dump: List[Dict[str, Any]] = []
+    attachment_dump: List[Dict[str, Any]] = []
+
+    for chunk_cluster_index, cluster in enumerate(chunk_clusters, start=1):
+        chunk_cluster_id = f"chunk-cluster-{chunk_cluster_index:03d}"
+        member_indices = list(cluster["member_indices"])
+        members = [chunks[index] for index in member_indices]
+        votes: Dict[str, int] = {}
+        for member in members:
+            session_cluster_id = conversation_to_session_cluster.get(str(member.get("conversation_id") or ""))
+            if session_cluster_id:
+                votes[session_cluster_id] = votes.get(session_cluster_id, 0) + 1
+
+        assigned_session_cluster: Optional[str] = None
+        centroid_similarity: Optional[float] = None
+        confidence = "unassigned"
+
+        if votes:
+            top_vote = max(votes.values())
+            candidate_ids = [cluster_id for cluster_id, count in votes.items() if count == top_vote]
+            if len(candidate_ids) == 1:
+                assigned_session_cluster = candidate_ids[0]
+            else:
+                assigned_session_cluster = max(
+                    candidate_ids,
+                    key=lambda cluster_id: cosine_similarity(
+                        cluster["centroid"],
+                        session_cluster_centroids.get(cluster_id, []),
+                    ),
+                )
+            centroid_similarity = cosine_similarity(
+                cluster["centroid"],
+                session_cluster_centroids.get(assigned_session_cluster, []),
+            )
+            confidence = build_attachment_confidence(
+                vote_count=top_vote,
+                total_count=len(members),
+                similarity=centroid_similarity,
+                tied=len(candidate_ids) > 1,
+            )
+            attachment_dump.append(
+                {
+                    "chunk_cluster_id": chunk_cluster_id,
+                    "session_cluster_id": assigned_session_cluster,
+                    "source_vote": votes,
+                    "centroid_similarity": round(centroid_similarity, 4),
+                    "confidence": confidence,
+                }
+            )
+
+        cluster_dump.append(
+            {
+                "chunk_cluster_id": chunk_cluster_id,
+                "member_count": len(members),
+                "session_cluster_id": assigned_session_cluster,
+                "source_vote": votes,
+                "centroid_similarity": round(centroid_similarity, 4) if centroid_similarity is not None else None,
+                "confidence": confidence,
+                "members": [
+                    {
+                        "chunk_id": member.get("chunk_id"),
+                        "conversation_id": member.get("conversation_id"),
+                        "conversation_title": member.get("conversation_title"),
+                        "turn_id": member.get("turn_id"),
+                        "source_path": member.get("source_path"),
+                        "question_excerpt": short_text(str(member.get("user") or "")),
+                        "answer_excerpt": short_text(str(member.get("assistant") or "")),
+                    }
+                    for member in members
+                ],
+            }
+        )
+
+    return cluster_dump, attachment_dump
 
 
 def cosine_similarity(left: Sequence[float], right: Sequence[float]) -> float:
@@ -849,6 +1034,10 @@ def run_pipeline(args: argparse.Namespace) -> int:
         project_dir = output_dir / sanitize_filename(project_name)
         summaries_path = project_dir / "conversation_summaries.jsonl"
         clusters_path = project_dir / "clusters.json"
+        session_clusters_path = project_dir / "session_clusters.json"
+        ab_chunks_path = project_dir / "ab_chunks.jsonl"
+        chunk_clusters_path = project_dir / "chunk_clusters.json"
+        chunk_links_path = project_dir / "chunk_to_session_cluster_links.json"
         report_path = project_dir / "project_report.md"
 
         cached_summaries = {} if args.force else load_jsonl_cache(summaries_path)
@@ -874,10 +1063,19 @@ def run_pipeline(args: argparse.Namespace) -> int:
 
         cluster_payloads: List[Dict[str, Any]] = []
         cluster_dump: List[Dict[str, Any]] = []
+        conversation_to_session_cluster: Dict[str, str] = {}
+        session_cluster_centroids: Dict[str, Sequence[float]] = {}
         for cluster_index, cluster in enumerate(clusters, start=1):
+            session_cluster_id = f"session-cluster-{cluster_index:03d}"
             member_summaries = [summaries[index] for index in cluster["member_indices"]]
             cluster_summary = client.summarize_cluster(project_name, member_summaries)
+            session_cluster_centroids[session_cluster_id] = list(cluster["centroid"])
+            for item in member_summaries:
+                conversation_id = str(item.get("conversation_id") or "")
+                if conversation_id:
+                    conversation_to_session_cluster[conversation_id] = session_cluster_id
             cluster_payload = {
+                "session_cluster_id": session_cluster_id,
                 "cluster_index": cluster_index,
                 "member_count": len(member_summaries),
                 "label": cluster_summary.get("label") or f"Cluster {cluster_index}",
@@ -899,6 +1097,28 @@ def run_pipeline(args: argparse.Namespace) -> int:
             cluster_payloads.append(cluster_payload)
             cluster_dump.append(cluster_payload)
         write_json(clusters_path, cluster_dump)
+        write_json(session_clusters_path, cluster_dump)
+
+        all_chunks: List[Dict[str, Any]] = []
+        for record in conversations:
+            all_chunks.extend(build_ab_chunks(record))
+        write_jsonl(ab_chunks_path, all_chunks)
+
+        chunk_cluster_dump: List[Dict[str, Any]] = []
+        chunk_attachment_dump: List[Dict[str, Any]] = []
+        if all_chunks:
+            chunk_threshold = args.chunk_cluster_threshold if args.chunk_cluster_threshold is not None else args.cluster_threshold
+            chunk_vectors = client.embedding_vectors([str(item.get("normalized_text") or "") for item in all_chunks])
+            chunk_clusters = cluster_summaries(all_chunks, chunk_vectors, chunk_threshold)
+            chunk_cluster_dump, chunk_attachment_dump = build_chunk_cluster_artifacts(
+                chunks=all_chunks,
+                chunk_vectors=chunk_vectors,
+                chunk_clusters=chunk_clusters,
+                conversation_to_session_cluster=conversation_to_session_cluster,
+                session_cluster_centroids=session_cluster_centroids,
+            )
+        write_json(chunk_clusters_path, chunk_cluster_dump)
+        write_json(chunk_links_path, chunk_attachment_dump)
 
         report_markdown = client.build_project_report(project_name, conversations, cluster_payloads)
         report_markdown = extract_report_markdown(report_markdown, project_name).rstrip() + "\n\n" + build_conversation_index_section(conversations)
