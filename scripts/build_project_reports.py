@@ -102,6 +102,22 @@ def parse_args() -> argparse.Namespace:
         default=8000,
         help="Maximum conversation body characters sent to the conversation summarizer.",
     )
+    parser.add_argument(
+        "--chunk-max-chars",
+        type=int,
+        default=4000,
+        help="Maximum normalized A/B chunk characters sent to the embedding model.",
+    )
+    parser.add_argument(
+        "--fallback-report-only",
+        action="store_true",
+        help="Skip LLM report writing and always emit the deterministic fallback report.",
+    )
+    parser.add_argument(
+        "--report-only",
+        action="store_true",
+        help="Rebuild project_report.md from existing structured artifacts without recomputing summaries, embeddings, or clusters.",
+    )
     parser.add_argument("--force", action="store_true", help="Rebuild summaries and reports even if cache exists.")
     parser.add_argument(
         "--sleep-seconds",
@@ -456,16 +472,20 @@ Conversation transcript:
         schema = """{
   "label": "short theme label",
   "summary": "1-3 paragraph cluster summary",
-  "key_points": ["string"],
-  "decisions": ["string"],
+  "concepts": ["string"],
+  "architectural_ideas": ["string"],
+  "engineering_decisions": ["string"],
+  "recurring_patterns": ["string"],
   "open_questions": ["string"],
   "representative_titles": ["string"]
 }"""
         field_rules = """Required keys:
 - label: short theme label
 - summary: 1-3 paragraph cluster summary grounded in the member conversations
-- key_points: short high-signal strings
-- decisions: actual decisions or directions across the cluster
+- concepts: normalized technical or product concepts that recur in the cluster
+- architectural_ideas: architectural ideas, system shapes, or design structures in the cluster
+- engineering_decisions: actual decisions or directions across the cluster
+- recurring_patterns: repeated behaviors, repeated concerns, or repeated motifs across the cluster
 - open_questions: unresolved issues across the cluster
 - representative_titles: existing conversation titles from the cluster
 
@@ -493,11 +513,92 @@ Return one JSON object only.
 
 {field_rules}
 
+Additional rules:
+- Normalize terminology when multiple conversations describe the same concept with different words.
+- Prefer session-level understanding as the primary basis for the topic.
+- Treat recurring chunk evidence and repeated wording as supporting evidence, not the main topic source.
+
 Project: {project_name}
 Conversation summaries:
 {chr(10).join(member_lines)}
 """
         return self._chat_json(prompt, max_tokens=1400, schema=schema)
+
+    def synthesize_project_knowledge(
+        self,
+        project_name: str,
+        conversations: Sequence[ConversationRecord],
+        topic_payloads: Sequence[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        schema = """{
+  "project_overview": "2-4 sentence project retrospective",
+  "concepts": [
+    {
+      "name": "string",
+      "summary": "string",
+      "supporting_topics": ["string"]
+    }
+  ],
+  "architectural_ideas": [
+    {
+      "idea": "string",
+      "supporting_topics": ["string"]
+    }
+  ],
+  "engineering_decisions": [
+    {
+      "decision": "string",
+      "supporting_topics": ["string"]
+    }
+  ],
+  "recurring_patterns": [
+    {
+      "pattern": "string",
+      "supporting_topics": ["string"]
+    }
+  ],
+  "open_questions": [
+    {
+      "question": "string",
+      "supporting_topics": ["string"]
+    }
+  ]
+}"""
+        topic_lines = []
+        for item in topic_payloads:
+            topic_lines.append(
+                json.dumps(
+                    {
+                        "label": item.get("label"),
+                        "summary": item.get("summary"),
+                        "concepts": item.get("concepts", []),
+                        "architectural_ideas": item.get("architectural_ideas", []),
+                        "engineering_decisions": item.get("engineering_decisions", []),
+                        "recurring_patterns": item.get("recurring_patterns", []),
+                        "open_questions": item.get("open_questions", []),
+                        "representative_titles": item.get("representative_titles", []),
+                        "evidence_concepts": item.get("evidence_concepts", []),
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        prompt = f"""You are building a structured technical retrospective for one project from topic-level syntheses.
+
+Return one JSON object only.
+
+Rules:
+- Normalize terminology so the same concept is named consistently across topics.
+- Treat session-level topic syntheses as primary evidence.
+- Treat chunk-derived evidence concepts as supporting evidence only.
+- Keep the output concise, technical, and traceable.
+- Do not output Markdown.
+
+Project: {project_name}
+Conversation count: {len(conversations)}
+Topic syntheses:
+{chr(10).join(topic_lines)}
+"""
+        return self._chat_json(prompt, max_tokens=2200, schema=schema)
 
     def build_project_report(
         self,
@@ -522,6 +623,8 @@ Conversation summaries:
                     "decisions": item["decisions"],
                     "open_questions": item["open_questions"],
                     "representative_titles": item["representative_titles"],
+                    "evidence_concepts": item.get("evidence_concepts", []),
+                    "attached_chunk_clusters": item.get("attached_chunk_clusters", []),
                 }
                 for item in cluster_payloads
             ],
@@ -534,6 +637,7 @@ Requirements:
 - The report must read like a project document, not like chat compression.
 - Emphasize engineering direction, design decisions, repeated patterns, and unresolved questions.
 - Mention representative conversation titles where useful.
+- Use attached chunk evidence only as supporting detail for recurring concepts or subtopics.
 - Keep the report concise and complete.
 - Target roughly 400-700 words before the conversation index.
 
@@ -629,8 +733,12 @@ Structured project context:
             "Fill all fields with source-grounded content. "
             "Do not echo placeholder words or field descriptions."
         )
-        first_pass = self._chat_text_payload(schema_prompt, max_tokens=max_tokens, extra_payload={"response_format": schema_payload})
         try:
+            first_pass = self._chat_text_payload(
+                schema_prompt,
+                max_tokens=max_tokens,
+                extra_payload={"response_format": schema_payload},
+            )
             payload = extract_json_block(first_pass)
             if not self._looks_like_placeholder(payload):
                 return payload
@@ -723,6 +831,14 @@ def short_text(value: str, limit: int = 160) -> str:
     return compact[: max(limit - 3, 1)].rstrip() + "..."
 
 
+def summarize_chunk_member_question(member: Dict[str, Any], limit: int = 90) -> str:
+    return short_text(str(member.get("user") or ""), limit=limit)
+
+
+def build_evidence_concepts(members: Sequence[Dict[str, Any]], limit: int = 4) -> List[str]:
+    return unique_preserving_order(summarize_chunk_member_question(member) for member in members)[:limit]
+
+
 def extract_report_markdown(text: str, project_name: str) -> str:
     cleaned = text.strip()
     start_marker = f"# {project_name} Report"
@@ -752,6 +868,119 @@ def extract_report_markdown(text: str, project_name: str) -> str:
     return "\n".join(kept).strip()
 
 
+def aggregate_topic_items(topic_payloads: Sequence[Dict[str, Any]], field_name: str, key_name: str) -> List[Dict[str, Any]]:
+    aggregated: Dict[str, Dict[str, Any]] = {}
+    for topic in topic_payloads:
+        topic_label = str(topic.get("label") or "Topic")
+        for raw_item in topic.get(field_name) or []:
+            value = str(raw_item).strip()
+            if not value:
+                continue
+            key = value.casefold()
+            record = aggregated.setdefault(key, {key_name: value, "supporting_topics": []})
+            if topic_label not in record["supporting_topics"]:
+                record["supporting_topics"].append(topic_label)
+    return list(aggregated.values())
+
+
+def build_fallback_project_knowledge(
+    project_name: str,
+    conversations: Sequence[ConversationRecord],
+    topic_payloads: Sequence[Dict[str, Any]],
+) -> Dict[str, Any]:
+    start_time = min((item.create_time for item in conversations if item.create_time), default="")
+    end_time = max((item.update_time for item in conversations if item.update_time), default="")
+    topic_labels = ", ".join(str(item.get("label") or "Topic") for item in topic_payloads[:4])
+    project_overview = (
+        f"{project_name} 目前整理了 {len(conversations)} 篇對話，時間範圍約為 {start_time or 'unknown'} 到 {end_time or 'unknown'}。"
+        f" 本報告先以 session-level topics 為主，再用 turn-pair evidence 補充 recurring concepts。"
+    )
+    if topic_labels:
+        project_overview += f" 目前較明確的 topics 包括：{topic_labels}。"
+
+    return {
+        "project_overview": project_overview,
+        "concepts": aggregate_topic_items(topic_payloads, "concepts", "name")[:12],
+        "architectural_ideas": aggregate_topic_items(topic_payloads, "architectural_ideas", "idea")[:12],
+        "engineering_decisions": aggregate_topic_items(topic_payloads, "engineering_decisions", "decision")[:12],
+        "recurring_patterns": aggregate_topic_items(topic_payloads, "recurring_patterns", "pattern")[:12],
+        "open_questions": aggregate_topic_items(topic_payloads, "open_questions", "question")[:12],
+    }
+
+
+def render_project_knowledge_entries(
+    heading: str,
+    entries: Sequence[Dict[str, Any]],
+    key_name: str,
+    summary_key: Optional[str] = None,
+) -> List[str]:
+    lines = [heading]
+    if not entries:
+        lines.extend(["- None captured.", ""])
+        return lines
+
+    for entry in entries:
+        label = str(entry.get(key_name) or "").strip()
+        if not label:
+            continue
+        summary = str(entry.get(summary_key) or "").strip() if summary_key else ""
+        support = ", ".join(str(item) for item in entry.get("supporting_topics") or [])
+        line = f"- **{label}**"
+        if summary:
+            line += f": {summary}"
+        if support:
+            line += f" Sources: {support}"
+        lines.append(line)
+    lines.append("")
+    return lines
+
+
+def render_topic_map(topic_payloads: Sequence[Dict[str, Any]]) -> List[str]:
+    lines = ["## Topic Map", ""]
+    if not topic_payloads:
+        lines.extend(["_No topic records were generated._", ""])
+        return lines
+
+    for topic in topic_payloads:
+        label = str(topic.get("label") or "Topic")
+        lines.append(f"### {label}")
+        lines.append(str(topic.get("summary") or "").strip())
+        source_refs = []
+        for member in topic.get("members") or []:
+            title = str(member.get("title") or "Untitled")
+            source_path = str(member.get("source_path") or "")
+            source_refs.append(f"{title} (`{source_path}`)" if source_path else title)
+        if source_refs:
+            lines.append(f"Sources: {'; '.join(source_refs[:6])}")
+        evidence_concepts = list(topic.get("evidence_concepts") or [])[:4]
+        if evidence_concepts:
+            lines.append(f"Evidence Concepts: {'; '.join(evidence_concepts)}")
+        lines.append("")
+    return lines
+
+
+def render_project_report_markdown(
+    project_name: str,
+    project_knowledge: Dict[str, Any],
+    topic_payloads: Sequence[Dict[str, Any]],
+    conversations: Sequence[ConversationRecord],
+) -> str:
+    lines = [
+        f"# {project_name} Report",
+        "",
+        "## Project Overview",
+        str(project_knowledge.get("project_overview") or "").strip(),
+        "",
+    ]
+    lines.extend(render_project_knowledge_entries("## Concepts", project_knowledge.get("concepts") or [], "name", "summary"))
+    lines.extend(render_project_knowledge_entries("## Architectural Ideas", project_knowledge.get("architectural_ideas") or [], "idea"))
+    lines.extend(render_project_knowledge_entries("## Engineering Decisions", project_knowledge.get("engineering_decisions") or [], "decision"))
+    lines.extend(render_project_knowledge_entries("## Recurring Patterns", project_knowledge.get("recurring_patterns") or [], "pattern"))
+    lines.extend(render_project_knowledge_entries("## Open Questions", project_knowledge.get("open_questions") or [], "question"))
+    lines.extend(render_topic_map(topic_payloads))
+    return "\n".join(lines).rstrip() + "\n\n" + build_conversation_index_section(conversations)
+
+
 def build_fallback_project_report(
     project_name: str,
     conversations: Sequence[ConversationRecord],
@@ -762,7 +991,9 @@ def build_fallback_project_report(
     theme_lines = []
     for cluster in cluster_payloads:
         summary = str(cluster.get("summary") or "").strip().replace("\n", " ")
-        theme_lines.append(f"- **{cluster.get('label') or 'Theme'}**: {summary}")
+        evidence_concepts = list(cluster.get("evidence_concepts") or [])[:3]
+        evidence_suffix = f" Evidence: {', '.join(evidence_concepts)}." if evidence_concepts else ""
+        theme_lines.append(f"- **{cluster.get('label') or 'Theme'}**: {summary}{evidence_suffix}")
 
     decisions = unique_preserving_order(
         str(item)
@@ -829,7 +1060,6 @@ def build_attachment_confidence(vote_count: int, total_count: int, similarity: f
 
 def build_chunk_cluster_artifacts(
     chunks: Sequence[Dict[str, Any]],
-    chunk_vectors: Sequence[Sequence[float]],
     chunk_clusters: Sequence[Dict[str, Any]],
     conversation_to_session_cluster: Dict[str, str],
     session_cluster_centroids: Dict[str, Sequence[float]],
@@ -892,6 +1122,7 @@ def build_chunk_cluster_artifacts(
                 "source_vote": votes,
                 "centroid_similarity": round(centroid_similarity, 4) if centroid_similarity is not None else None,
                 "confidence": confidence,
+                "evidence_concepts": build_evidence_concepts(members),
                 "members": [
                     {
                         "chunk_id": member.get("chunk_id"),
@@ -908,6 +1139,50 @@ def build_chunk_cluster_artifacts(
         )
 
     return cluster_dump, attachment_dump
+
+
+def attach_chunk_evidence_to_session_clusters(
+    session_clusters: Sequence[Dict[str, Any]],
+    chunk_clusters: Sequence[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    attached_by_session: Dict[str, List[Dict[str, Any]]] = {}
+    for chunk_cluster in chunk_clusters:
+        session_cluster_id = str(chunk_cluster.get("session_cluster_id") or "")
+        if not session_cluster_id:
+            continue
+        attached_by_session.setdefault(session_cluster_id, []).append(chunk_cluster)
+
+    enriched: List[Dict[str, Any]] = []
+    for cluster in session_clusters:
+        session_cluster_id = str(cluster.get("session_cluster_id") or "")
+        attached_chunks = attached_by_session.get(session_cluster_id, [])
+        attached_chunks = sorted(
+            attached_chunks,
+            key=lambda item: (
+                {"high": 0, "medium": 1, "low": 2}.get(str(item.get("confidence") or ""), 3),
+                -int(item.get("member_count") or 0),
+            ),
+        )
+        evidence_concepts = unique_preserving_order(
+            concept
+            for item in attached_chunks
+            for concept in (item.get("evidence_concepts") or [])
+        )[:6]
+
+        enriched_cluster = dict(cluster)
+        enriched_cluster["attached_chunk_clusters"] = [
+            {
+                "chunk_cluster_id": item.get("chunk_cluster_id"),
+                "member_count": item.get("member_count"),
+                "confidence": item.get("confidence"),
+                "evidence_concepts": item.get("evidence_concepts") or [],
+            }
+            for item in attached_chunks[:5]
+        ]
+        enriched_cluster["evidence_concepts"] = evidence_concepts
+        enriched.append(enriched_cluster)
+
+    return enriched
 
 
 def cosine_similarity(left: Sequence[float], right: Sequence[float]) -> float:
@@ -1020,14 +1295,16 @@ def run_pipeline(args: argparse.Namespace) -> int:
     output_dir = Path(args.output_dir).resolve()
     projects = sorted_project_conversations(input_dir, args.project, args.limit_conversations)
 
-    client = LocalModelClient(
-        embedding_base_url=EMBEDDING_BASE_URL,
-        embedding_model=EMBEDDING_MODEL,
-        llm_base_url=LLM_BASE_URL,
-        llm_model=LLM_MODEL,
-        llm_api_key=LLM_API_KEY,
-        sleep_seconds=args.sleep_seconds,
-    )
+    client: Optional[LocalModelClient] = None
+    if not args.report_only:
+        client = LocalModelClient(
+            embedding_base_url=EMBEDDING_BASE_URL,
+            embedding_model=EMBEDDING_MODEL,
+            llm_base_url=LLM_BASE_URL,
+            llm_model=LLM_MODEL,
+            llm_api_key=LLM_API_KEY,
+            sleep_seconds=args.sleep_seconds,
+        )
 
     for project_name, conversations in projects.items():
         print(f"Project: {project_name}", file=sys.stderr)
@@ -1038,7 +1315,29 @@ def run_pipeline(args: argparse.Namespace) -> int:
         ab_chunks_path = project_dir / "ab_chunks.jsonl"
         chunk_clusters_path = project_dir / "chunk_clusters.json"
         chunk_links_path = project_dir / "chunk_to_session_cluster_links.json"
+        project_knowledge_path = project_dir / "project_knowledge.json"
         report_path = project_dir / "project_report.md"
+
+        if args.report_only:
+            if project_knowledge_path.exists():
+                project_knowledge = json.loads(project_knowledge_path.read_text(encoding="utf-8"))
+                topic_payloads = []
+                if session_clusters_path.exists():
+                    payload = json.loads(session_clusters_path.read_text(encoding="utf-8"))
+                    if isinstance(payload, list):
+                        topic_payloads = payload
+            elif session_clusters_path.exists():
+                payload = json.loads(session_clusters_path.read_text(encoding="utf-8"))
+                topic_payloads = payload if isinstance(payload, list) else []
+                project_knowledge = build_fallback_project_knowledge(project_name, conversations, topic_payloads)
+            else:
+                raise PipelineError(
+                    f"Cannot rebuild report for {project_name}: missing {project_knowledge_path.name} and {session_clusters_path.name}."
+                )
+
+            report_markdown = render_project_report_markdown(project_name, project_knowledge, topic_payloads, conversations)
+            write_text(report_path, report_markdown)
+            continue
 
         cached_summaries = {} if args.force else load_jsonl_cache(summaries_path)
         summaries: List[Dict[str, Any]] = []
@@ -1053,11 +1352,15 @@ def run_pipeline(args: argparse.Namespace) -> int:
                 summaries.append(cached)
                 continue
             print(f"  summarize: {record.title}", file=sys.stderr)
+            if client is None:
+                raise PipelineError("LocalModelClient was not initialized.")
             summary = client.summarize_conversation(record, args.summary_max_chars)
             summaries.append(summary)
         write_jsonl(summaries_path, summaries)
 
         texts = [embedding_text(summary) for summary in summaries]
+        if client is None:
+            raise PipelineError("LocalModelClient was not initialized.")
         vectors = client.embedding_vectors(texts)
         clusters = cluster_summaries(summaries, vectors, args.cluster_threshold)
 
@@ -1068,6 +1371,8 @@ def run_pipeline(args: argparse.Namespace) -> int:
         for cluster_index, cluster in enumerate(clusters, start=1):
             session_cluster_id = f"session-cluster-{cluster_index:03d}"
             member_summaries = [summaries[index] for index in cluster["member_indices"]]
+            if client is None:
+                raise PipelineError("LocalModelClient was not initialized.")
             cluster_summary = client.summarize_cluster(project_name, member_summaries)
             session_cluster_centroids[session_cluster_id] = list(cluster["centroid"])
             for item in member_summaries:
@@ -1080,9 +1385,13 @@ def run_pipeline(args: argparse.Namespace) -> int:
                 "member_count": len(member_summaries),
                 "label": cluster_summary.get("label") or f"Cluster {cluster_index}",
                 "summary": cluster_summary.get("summary") or "",
-                "key_points": cluster_summary.get("key_points") or [],
-                "decisions": cluster_summary.get("decisions") or [],
+                "key_points": cluster_summary.get("concepts") or [],
+                "decisions": cluster_summary.get("engineering_decisions") or [],
                 "open_questions": cluster_summary.get("open_questions") or [],
+                "concepts": cluster_summary.get("concepts") or [],
+                "architectural_ideas": cluster_summary.get("architectural_ideas") or [],
+                "engineering_decisions": cluster_summary.get("engineering_decisions") or [],
+                "recurring_patterns": cluster_summary.get("recurring_patterns") or [],
                 "representative_titles": cluster_summary.get("representative_titles") or [],
                 "members": [
                     {
@@ -1097,7 +1406,6 @@ def run_pipeline(args: argparse.Namespace) -> int:
             cluster_payloads.append(cluster_payload)
             cluster_dump.append(cluster_payload)
         write_json(clusters_path, cluster_dump)
-        write_json(session_clusters_path, cluster_dump)
 
         all_chunks: List[Dict[str, Any]] = []
         for record in conversations:
@@ -1108,20 +1416,36 @@ def run_pipeline(args: argparse.Namespace) -> int:
         chunk_attachment_dump: List[Dict[str, Any]] = []
         if all_chunks:
             chunk_threshold = args.chunk_cluster_threshold if args.chunk_cluster_threshold is not None else args.cluster_threshold
-            chunk_vectors = client.embedding_vectors([str(item.get("normalized_text") or "") for item in all_chunks])
+            if client is None:
+                raise PipelineError("LocalModelClient was not initialized.")
+            chunk_vectors = client.embedding_vectors(
+                [truncate_for_summary(str(item.get("normalized_text") or ""), args.chunk_max_chars) for item in all_chunks]
+            )
             chunk_clusters = cluster_summaries(all_chunks, chunk_vectors, chunk_threshold)
             chunk_cluster_dump, chunk_attachment_dump = build_chunk_cluster_artifacts(
                 chunks=all_chunks,
-                chunk_vectors=chunk_vectors,
                 chunk_clusters=chunk_clusters,
                 conversation_to_session_cluster=conversation_to_session_cluster,
                 session_cluster_centroids=session_cluster_centroids,
             )
+        cluster_payloads = attach_chunk_evidence_to_session_clusters(cluster_payloads, chunk_cluster_dump)
+        cluster_dump = attach_chunk_evidence_to_session_clusters(cluster_dump, chunk_cluster_dump)
+        write_json(session_clusters_path, cluster_dump)
         write_json(chunk_clusters_path, chunk_cluster_dump)
         write_json(chunk_links_path, chunk_attachment_dump)
 
-        report_markdown = client.build_project_report(project_name, conversations, cluster_payloads)
-        report_markdown = extract_report_markdown(report_markdown, project_name).rstrip() + "\n\n" + build_conversation_index_section(conversations)
+        if args.fallback_report_only:
+            project_knowledge = build_fallback_project_knowledge(project_name, conversations, cluster_payloads)
+        else:
+            try:
+                if client is None:
+                    raise PipelineError("LocalModelClient was not initialized.")
+                project_knowledge = client.synthesize_project_knowledge(project_name, conversations, cluster_payloads)
+            except PipelineError:
+                project_knowledge = build_fallback_project_knowledge(project_name, conversations, cluster_payloads)
+        write_json(project_knowledge_path, project_knowledge)
+
+        report_markdown = render_project_report_markdown(project_name, project_knowledge, cluster_payloads, conversations)
         write_text(report_path, report_markdown)
 
     index_path = output_dir / "index.md"
