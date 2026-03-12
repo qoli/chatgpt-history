@@ -5,6 +5,7 @@
 - Review `SPEC.md` and confirm the desired report style.
 - Decide whether intermediate conversation summaries should be stored as JSONL only or also as Markdown.
 - Rename legacy scripts that still mention PDF / Google Drive if they will remain part of this repo.
+- Decide whether fallback-generated reports should be kept as-is or marked explicitly in the output.
 
 ## Pipeline v1
 
@@ -15,7 +16,8 @@
 - Done: implement per-project semantic grouping.
 - Done: implement project report generation for one `project_report.md` per project.
 - Done: implement `index.md` generation across all project reports.
-- Next: validate the pipeline on more than one conversation per project.
+- Done: validate the pipeline on more than one conversation per project.
+- Done: rebuild `index.md` from on-disk reports so partial reruns do not wipe prior entries.
 - Next: tune prompts and report size for larger projects.
 
 ## Clustering And Report Design
@@ -38,6 +40,7 @@
 - Done: add deterministic fallback report generation when LLM report output is incomplete.
 - Next: tune clustering threshold so conceptually adjacent conversations are merged when appropriate.
 - Next: validate on a larger project such as `HLN Machine` or `observo`.
+- Next: decide whether reports should be normalized to one language when cluster summaries mix Chinese and English.
 
 ## Future
 

@@ -47,6 +47,11 @@ browser_control/output/project_reports/
     clusters.json
 ```
 
+Current output notes:
+
+- `index.md` is rebuilt from the report directories on disk, so partial reruns do not erase previously generated project reports from the index.
+- `project_report.md` may come from either the LLM-written path or a deterministic fallback path when the LLM report is incomplete.
+
 ## Pipeline
 
 ### 1. Parse Markdown Conversations
@@ -158,6 +163,31 @@ Secondary emphasis:
 - product framing
 - naming and messaging
 
+## Run Commands
+
+Run all projects:
+
+```bash
+cd /Volumes/Data/Github/chatgpt-history
+python3 scripts/build_project_reports.py
+```
+
+Recommended safer run for the current local 122B setup:
+
+```bash
+cd /Volumes/Data/Github/chatgpt-history
+python3 scripts/build_project_reports.py --summary-max-chars 4000 --sleep-seconds 0.05
+```
+
+Run one project:
+
+```bash
+cd /Volumes/Data/Github/chatgpt-history
+python3 scripts/build_project_reports.py --project 'Magic Vision'
+python3 scripts/build_project_reports.py --project 'Nano Tower'
+python3 scripts/build_project_reports.py --project 'B-Roll 方程式'
+```
+
 ## Non-Goals
 
 - no PDF generation
@@ -190,9 +220,11 @@ These are intentionally still unresolved:
   - `project_report.md` and `index.md` written successfully
   - multi-conversation clustering behaves plausibly, though threshold tuning is still open
   - final report cleanup successfully strips LM Studio reasoning text from generated reports
+  - deterministic fallback report path works when LLM report output is incomplete
 - Known remaining risks:
   - larger projects may still be slow with the current local 122B model
   - prompt tuning is still needed for higher consistency across diverse conversation styles
+  - fallback reports are structurally complete but may be more mechanical and mixed-language than LLM-authored reports
 
 ## Suggested v1 Implementation Order
 
