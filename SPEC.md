@@ -1,12 +1,26 @@
-# ChatGPT History Summarization Spec
+# ChatGPT History Analysis Spec
 
 ## Status
 
-Prototype implemented. The local pipeline script exists and has been validated end-to-end on a minimal `B-Roll 方程式` run with one conversation, on a multi-conversation `Nano Tower` run with three conversations, and on a medium `Magic Vision` run with nine conversations. Conversation summaries, embeddings, per-project clustering, and final Markdown report generation are all wired up. Remaining work is focused on report quality, runtime tuning, and broader validation on larger projects.
+The current pipeline is no longer a flat project-summary prototype. The implemented flow in `scripts/build_project_reports.py` is now a structured, multi-layer analysis pipeline:
+
+- session-level understanding is the primary topic layer
+- A/B turn-pair chunks provide supporting evidence
+- project reports are rendered from intermediate structured knowledge, not written directly as one opaque Markdown prompt
+
+The remaining work is quality tuning, larger-project validation, and better evidence abstraction.
 
 ## Goal
 
-Build a local pipeline that reads exported ChatGPT project conversations from Markdown, summarizes them with local models, groups related conversations semantically, and produces one report per project.
+Build a local pipeline that reads exported ChatGPT project conversations from Markdown and produces one structured, traceable technical retrospective per project.
+
+The report should:
+
+- discover recurring concepts and topics across conversations
+- keep topic derivation anchored in whole-session understanding
+- use turn-pair chunks as evidence, not as the main report driver
+- separate concepts, architecture, decisions, patterns, and open questions
+- remain traceable back to original conversations
 
 ## Inputs
 
@@ -20,6 +34,8 @@ Build a local pipeline that reads exported ChatGPT project conversations from Ma
   - `update_time`
   - conversation body
 
+Raw conversation files are read-only inputs. The pipeline does not modify them.
+
 ## Local Model Endpoints
 
 ### Embedding API
@@ -32,11 +48,14 @@ Build a local pipeline that reads exported ChatGPT project conversations from Ma
 - Base URL: `http://ronnie-mac-studio.local:1234/v1`
 - Model: `qwen3.5-122b-a10b-text-mlx`
 
-## Output
+Implementation note:
 
-One report per project.
+- structured chat calls first try `response_format=json_schema`
+- if LM Studio rejects schema output, the client falls back to plain JSON prompting instead of hard-failing
 
-Recommended output layout:
+## Output Layout
+
+Per-project outputs are written under:
 
 ```text
 browser_control/output/project_reports/
@@ -45,12 +64,69 @@ browser_control/output/project_reports/
     project_report.md
     conversation_summaries.jsonl
     clusters.json
+    session_clusters.json
+    ab_chunks.jsonl
+    chunk_clusters.json
+    chunk_to_session_cluster_links.json
+    project_knowledge.json
+    timeline.json
 ```
 
-Current output notes:
+Artifact roles:
 
-- `index.md` is rebuilt from the report directories on disk, so partial reruns do not erase previously generated project reports from the index.
-- `project_report.md` may come from either the LLM-written path or a deterministic fallback path when the LLM report is incomplete.
+- `conversation_summaries.jsonl`
+  Session-level structured summaries.
+- `clusters.json`
+  Session cluster summaries before chunk evidence is attached.
+- `session_clusters.json`
+  Enriched session clusters used as the main topic layer for the report.
+- `ab_chunks.jsonl`
+  A/B turn-pair chunk records extracted from the original conversation markdown.
+- `chunk_clusters.json`
+  Chunk-level evidence groupings.
+- `chunk_to_session_cluster_links.json`
+  Attachment map from chunk clusters back to session clusters.
+- `project_knowledge.json`
+  Structured project synthesis used to render the final report.
+- `timeline.json`
+  Structured event timeline derived from project knowledge and topic records.
+- `project_report.md`
+  Final deterministic report rendered from structured intermediate artifacts.
+- `index.md`
+  Aggregate index rebuilt from report directories on disk.
+
+## Core Design
+
+### Session Layer
+
+The session layer is the main topic-discovery layer.
+
+- one conversation becomes one structured session summary
+- session summaries are embedded and clustered per project
+- cluster summaries become the primary topic records
+- final synthesis is session-first
+
+This is where dominant topics and recurring project-level themes should come from.
+
+### Chunk Layer
+
+The chunk layer is an evidence layer.
+
+- each chunk is one `User -> Assistant` turn pair
+- chunks are embedded separately from sessions
+- chunk clusters discover finer recurring concepts and question patterns
+- chunk clusters are attached back to session clusters as supporting evidence
+
+This layer should improve topic purity and recall without replacing session-level understanding.
+
+### Synthesis Rule
+
+The report is generated from structured knowledge assembled across layers:
+
+- session clusters define the main topics
+- chunk clusters provide evidence concepts and recurring subtopics
+- project knowledge organizes the final report sections
+- timeline entries capture evolution and turning points
 
 ## Pipeline
 
@@ -58,166 +134,257 @@ Current output notes:
 
 For each Markdown file:
 
-- parse frontmatter
-- extract conversation title and project name
-- extract conversation body
-- preserve source path for traceability
+- parse frontmatter and metadata
+- extract conversation content
+- preserve relative source path for traceability
+- keep conversation order and timestamps
 
-Structured output:
+Output:
 
-- one normalized in-memory record per conversation
+- one normalized in-memory conversation record per file
 
-### 2. Conversation-Level Summarization
+### 2. Session-Level Summarization
 
-Each conversation should be summarized independently before any project-level report generation.
+Each conversation is summarized independently before project-level synthesis.
 
-Current implementation note:
+Current summary schema includes structured fields such as:
 
-- `scripts/build_project_reports.py` now uses LM Studio `response_format=json_schema` for structured outputs.
-- The client falls back to `reasoning_content` when LM Studio leaves `message.content` empty.
-- Default `--summary-max-chars` has been reduced to `8000` to keep the local 122B model practical.
-- Final report generation now includes post-processing cleanup for LM Studio reasoning-heavy outputs.
-- If the LLM still fails to produce a complete report, the pipeline falls back to a deterministic report assembled from cluster summaries.
+- `summary`
+- `key_points`
+- `decisions`
+- `open_questions`
+- `keywords`
+- `category_guess`
 
-Recommended summary schema:
-
-```json
-{
-  "conversation_id": "string",
-  "title": "string",
-  "project": "string",
-  "summary": "string",
-  "key_points": ["string"],
-  "decisions": ["string"],
-  "open_questions": ["string"],
-  "keywords": ["string"],
-  "category_guess": "string"
-}
-```
-
-Why this exists:
+Why this stage exists:
 
 - reduces token load for later stages
-- makes semantic grouping more stable
-- separates extraction from final writing
+- normalizes terminology before embedding
+- gives the pipeline a stable semantic representation per conversation
 
-### 3. Embedding and Semantic Grouping
+### 3. Session Embedding and Per-Project Clustering
 
-Embeddings should be built from compressed semantic text, not raw full conversations.
+Embeddings are built from compressed semantic text rather than raw conversation bodies.
 
-Recommended embedding text composition:
+Session clustering happens per project only.
 
-- title
-- summary
-- keywords
-- decisions
+Current outcome:
 
-Grouping should happen inside each project only.
+- related sessions are grouped into topic clusters
+- cluster summaries produce labels, concepts, architecture ideas, decisions, patterns, and open questions
 
-Target outcome:
+### 4. Topic-Level Session Synthesis
 
-- identify topic clusters
-- merge branch-like or duplicate conversations
-- reduce repetition in the final report
+Each session cluster is summarized into a structured topic record.
 
-### 4. Cluster Summaries
+These topic records are stored in `clusters.json` and then enriched into `session_clusters.json`.
 
-For each project cluster, generate:
+This is the main source for:
 
-- cluster label
-- cluster summary
-- representative conversations
-- repeated viewpoints
-- unresolved questions
+- report topics
+- topic-level concept separation
+- project-level synthesis
 
-### 5. Project Report Generation
+### 5. A/B Turn-Pair Chunk Extraction
 
-Generate one Markdown report per project using the cluster summaries as the main input.
+Each conversation is also parsed into turn-pair chunks:
 
-Recommended report structure:
+- `User + Assistant`
+- incomplete runs like `User, User, Assistant` are repaired by pairing the last pending user turn with the next assistant turn
+
+Chunk text is normalized into a stable embedding format:
+
+```text
+Question:
+...
+
+Answer:
+...
+```
+
+### 6. Chunk Embedding and Evidence Grouping
+
+Chunks are embedded independently from sessions and clustered per project.
+
+Current role of chunk clusters:
+
+- discover recurring micro-topics across sessions
+- provide evidence concepts
+- improve traceability from report themes back to concrete turns
+
+Chunk clusters are not the primary report topics.
+
+### 7. Chunk-to-Session Attachment
+
+Chunk clusters are attached back to session clusters.
+
+Current attachment design combines:
+
+- source-session ownership
+- centroid similarity
+
+Result:
+
+- `session_clusters.json` becomes the enriched topic layer with attached evidence
+- report synthesis stays session-first while still using chunk-level support
+
+### 8. Project-Level Knowledge Synthesis
+
+The report is not generated directly from raw cluster text.
+
+Instead, the pipeline builds `project_knowledge.json`, which separates:
+
+- concepts
+- architectural ideas
+- engineering decisions
+- recurring patterns
+- open questions
+
+This can be produced in two ways:
+
+- full synthesis through the local LLM
+- deterministic fallback synthesis when `--fallback-report-only` is used or when the LLM path fails
+
+### 9. Timeline Generation
+
+The pipeline builds `timeline.json` from project knowledge and topic records.
+
+Timeline design:
+
+- event-oriented, not transcript-oriented
+- based primarily on session-level topics
+- chunk evidence supports events but does not drive them
+
+### 10. Deterministic Report Rendering
+
+The final Markdown report is rendered from:
+
+- `project_knowledge.json`
+- `session_clusters.json`
+- `timeline.json`
+- original conversation metadata
+
+This keeps the final report traceable and stable even when the final LLM Markdown-writing step is skipped.
+
+## Final Report Structure
+
+The current report renderer produces:
 
 ```md
 # <Project Name> Report
 
 ## Project Overview
-## Core Themes
-## Key Decisions
-## Repeated Patterns
+## Concepts
+## Architectural Ideas
+## Engineering Decisions
+## Recurring Patterns
 ## Open Questions
+## Key Timeline
+## Topic Map
 ## Conversation Index
 ```
 
-## Report Intent
+This is intended to read like a distilled technical retrospective, not a transcript summary.
 
-The report should be a project document, not a raw transcript compression.
+## Traceability Rules
 
-Primary emphasis:
+Traceability is a core requirement.
 
-- engineering direction
-- design decisions
-- recurring concepts
-- unresolved issues
+The pipeline preserves it by:
 
-Secondary emphasis:
+- keeping `conversation_id`, title, timestamps, and source path in intermediate records
+- recording cluster members in session topic payloads
+- attaching chunk evidence back to session clusters instead of flattening it away
+- rendering `Topic Map` and `Conversation Index` sections in the final report
 
-- product framing
-- naming and messaging
+The existing conversation index is maintained. The pipeline rebuilds `index.md` from on-disk project outputs.
 
 ## Run Commands
 
-Run all projects:
+### Stable Full Rebuild for All Projects
 
 ```bash
 cd /Volumes/Data/Github/chatgpt-history
-python3 scripts/build_project_reports.py
+python3 scripts/build_project_reports.py --fallback-report-only --sleep-seconds 0.05
 ```
 
-Recommended safer run for the current local 122B setup:
+### Rebuild Only Final Reports
 
 ```bash
 cd /Volumes/Data/Github/chatgpt-history
-python3 scripts/build_project_reports.py --summary-max-chars 4000 --sleep-seconds 0.05
+python3 scripts/build_project_reports.py --report-only
 ```
 
-Run one project:
+### Force Full Regeneration
 
 ```bash
 cd /Volumes/Data/Github/chatgpt-history
-python3 scripts/build_project_reports.py --project 'Magic Vision'
-python3 scripts/build_project_reports.py --project 'Nano Tower'
-python3 scripts/build_project_reports.py --project 'B-Roll 方程式'
+python3 scripts/build_project_reports.py --force --fallback-report-only --sleep-seconds 0.05
 ```
+
+### Clean Rebuild
+
+```bash
+cd /Volumes/Data/Github/chatgpt-history
+rm -rf browser_control/output/project_reports
+python3 scripts/build_project_reports.py --force --fallback-report-only --sleep-seconds 0.05
+```
+
+### Rebuild One Project
+
+```bash
+cd /Volumes/Data/Github/chatgpt-history
+python3 scripts/build_project_reports.py --project 'Nano Tower' --fallback-report-only --sleep-seconds 0.05
+python3 scripts/build_project_reports.py --project 'Nano Tower' --report-only
+```
+
+## Constraints
+
+- Do not modify raw conversation files.
+- Keep the project-level `index.md`.
+- Avoid relying on prompt structure alone for report organization.
+- Prefer intermediate structured artifacts over direct Markdown generation.
+- Keep clustering per project; cross-project clustering is not part of the current pipeline.
 
 ## Non-Goals
 
 - no PDF generation
 - no Google Drive sync
-- no cross-project clustering in the first version
-- no attempt to preserve every sentence from the original chats
-
-## Open Decisions
-
-These are intentionally still unresolved:
-
-1. Whether to persist intermediate summaries as JSONL only, or also write Markdown per conversation.
-2. Which clustering strategy to use in v1:
-   - threshold-based nearest-neighbor grouping
-   - hierarchical clustering
-   - simple centroid merge
-3. How long each `project_report.md` should be.
-4. Whether branch conversations should be explicitly marked in the final report.
+- no cross-project topic clustering in the current implementation
+- no requirement to preserve every sentence from the original chats
+- no transcript-style timeline
 
 ## Current Validation Snapshot
 
-- End-to-end prototype script: `scripts/build_project_reports.py`
-- Validated projects:
-  - `B-Roll 方程式` (1 conversation)
-  - `Nano Tower` (3 conversations)
-  - `Magic Vision` (9 conversations)
-- Validation scope:
-  - summary JSON generated successfully
-  - cluster summaries generated successfully
-  - `project_report.md` and `index.md` written successfully
+Validated implementation: `scripts/build_project_reports.py`
+
+Validated projects:
+
+- `B-Roll 方程式`
+- `Nano Tower`
+- `Magic Vision`
+- `Telegram AI Workspace`
+
+Validated capabilities:
+
+- session-level conversation summaries
+- per-project session embedding and clustering
+- A/B turn-pair chunk extraction
+- per-project chunk embedding and clustering
+- chunk-to-session evidence attachment
+- `project_knowledge.json` generation
+- `timeline.json` generation
+- deterministic `project_report.md` rendering
+- `--report-only` report regeneration
+- schema-output failures no longer hard-stop the pipeline
+
+## Remaining Open Work
+
+1. Upgrade chunk evidence from question excerpts to better chunk-cluster abstractions.
+2. Tune clustering thresholds on larger and noisier projects.
+3. Compress and deduplicate timeline events so only turning points remain.
+4. Validate the new report structure on larger projects such as `HLN Machine`, `Syncnext`, `eisonAI`, and `observo`.
+5. Normalize mixed Chinese/English wording in synthesized outputs where needed.
   - multi-conversation clustering behaves plausibly, though threshold tuning is still open
   - final report cleanup successfully strips LM Studio reasoning text from generated reports
   - deterministic fallback report path works when LLM report output is incomplete
