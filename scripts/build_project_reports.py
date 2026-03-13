@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-from collections import Counter
 import json
 import math
 import os
@@ -844,134 +843,6 @@ def summarize_chunk_member_question(member: Dict[str, Any], limit: int = 90) -> 
     return short_text(str(member.get("user") or ""), limit=limit)
 
 
-def normalize_evidence_token(token: str) -> str:
-    value = token.strip()
-    if not value:
-        return ""
-    if re.fullmatch(r"[A-Za-z0-9_+./-]+", value):
-        return value.casefold()
-    return value
-
-
-def is_useful_evidence_token(token: str) -> bool:
-    value = normalize_evidence_token(token)
-    if not value:
-        return False
-    if len(value) <= 1:
-        return False
-    if value.isdigit():
-        return False
-    if value.startswith("http"):
-        return False
-    stopwords = {
-        "assistant",
-        "user",
-        "question",
-        "answer",
-        "python",
-        "python3",
-        "json",
-        "system",
-        "project",
-        "projects",
-        "agent",
-        "agents",
-        "workflow",
-        "workspace",
-        "runtime",
-        "using",
-        "based",
-        "design",
-        "model",
-        "models",
-        "environment",
-        "operating",
-        "architecture",
-        "automation",
-        "session",
-        "continue",
-        "new",
-        "with",
-        "from",
-        "into",
-        "over",
-        "under",
-        "layer",
-        "layers",
-        "core",
-        "mini",
-        "apps",
-        "app",
-        "bot",
-        "chat",
-        "interface",
-        "terminal",
-        "ai",
-        "ui",
-        "tool",
-        "tools",
-        "coding",
-        "devops",
-        "這個",
-        "那個",
-        "主要",
-        "主要是",
-        "核心",
-        "核心是",
-        "因為",
-        "所以",
-        "但是",
-        "可是",
-        "然後",
-        "對了",
-        "如果",
-        "似乎",
-        "感覺",
-        "其實",
-        "只是",
-        "就是",
-        "我們",
-        "你們",
-        "他們",
-        "這樣",
-        "一個",
-        "一些",
-        "東西",
-        "事情",
-        "問題",
-        "想法",
-        "內容",
-        "方式",
-        "功能",
-        "用戶",
-        "客戶",
-        "工作",
-        "項目",
-        "資料",
-        "產品",
-        "工具",
-        "能力",
-        "體驗",
-        "設計",
-        "管理",
-        "實作",
-        "可以",
-        "需要",
-        "應該",
-        "因爲",
-    }
-    return value not in stopwords
-
-
-def extract_evidence_tokens(text: str) -> List[str]:
-    tokens: List[str] = []
-    for raw_token in EVIDENCE_TOKEN_RE.findall(text):
-        if not is_useful_evidence_token(raw_token):
-            continue
-        tokens.append(raw_token)
-    return tokens
-
-
 def clean_member_theme(text: str, limit: int = 72) -> str:
     value = text.strip()
     if not value:
@@ -1027,50 +898,240 @@ def clean_member_theme(text: str, limit: int = 72) -> str:
     return short_text(candidate, limit=limit)
 
 
-def build_cluster_keyword_signature(members: Sequence[Dict[str, Any]]) -> str:
-    token_support: Counter[str] = Counter()
-    surface_forms: Dict[str, str] = {}
-    for member in members:
-        member_tokens = set()
-        source_text = str(member.get("user") or "")
-        for token in extract_evidence_tokens(source_text):
-            normalized = normalize_evidence_token(token)
-            if not normalized:
-                continue
-            member_tokens.add(normalized)
-            surface_forms.setdefault(normalized, token)
-        for normalized in member_tokens:
-            token_support[normalized] += 1
+def normalize_phrase_for_match(text: str) -> str:
+    value = unicodedata.normalize("NFKC", text)
+    value = value.casefold()
+    value = re.sub(r"https?://\S+", " ", value)
+    value = re.sub(r"[`*_#>\[\]\(\)\"'“”‘’]", " ", value)
+    value = re.sub(r"[\s_/\\|+-]+", " ", value)
+    value = re.sub(r"[，。！？!?;；,:：]", " ", value)
+    value = " ".join(value.split())
+    return value.strip()
 
-    if not token_support:
-        return ""
 
-    min_support = 2 if len(members) >= 3 else 1
-    ranked = [
-        (normalized, support)
-        for normalized, support in token_support.items()
-        if support >= min_support
-    ]
-    ranked.sort(key=lambda item: (-item[1], -len(item[0]), item[0]))
-    selected = [surface_forms[normalized] for normalized, _support in ranked[:3]]
-    if len(selected) < 2 and ranked:
-        selected = [surface_forms[normalized] for normalized, _support in ranked[:2]]
-    if not selected:
-        return ""
-    return " / ".join(selected)
+def phrase_match_tokens(text: str) -> List[str]:
+    normalized = normalize_phrase_for_match(text)
+    return [token for token in EVIDENCE_TOKEN_RE.findall(normalized) if len(token.strip()) >= 2]
+
+
+def phrase_token_set(text: str) -> set[str]:
+    return set(phrase_match_tokens(text))
+
+
+def looks_like_generic_phrase(text: str) -> bool:
+    normalized = normalize_phrase_for_match(text)
+    if not normalized:
+        return True
+    generic_phrases = {
+        "我在思考",
+        "我在想",
+        "我希望",
+        "我感覺",
+        "這個系統",
+        "這個產品",
+        "這個項目",
+        "重新回顧",
+        "重新回顧一下",
+        "交互形式",
+        "單一入口完成任務",
+    }
+    if normalized in {item.casefold() for item in generic_phrases}:
+        return True
+    tokens = phrase_match_tokens(text)
+    if not tokens:
+        return True
+    return len(tokens) == 1 and len(tokens[0]) <= 2
+
+
+def split_member_clauses(text: str) -> List[str]:
+    cleaned = text.strip()
+    if not cleaned:
+        return []
+    cleaned = re.sub(r"https?://\S+", " ", cleaned)
+    cleaned = cleaned.replace("🆕", " ").replace("🔄", " ")
+    cleaned = re.sub(r"`[^`]+`", " ", cleaned)
+    cleaned = re.sub(r"\[[^\]]+\]\([^)]+\)", " ", cleaned)
+    cleaned = " ".join(cleaned.split())
+    raw_parts = re.split(r"[\n\r。！？!?;；]", cleaned)
+    clauses: List[str] = []
+    for part in raw_parts:
+        stripped = part.strip(" ,，:：-")
+        if not stripped:
+            continue
+        subparts = [stripped]
+        if len(stripped) > 40:
+            subparts = [piece.strip(" ,，:：-") for piece in re.split(r"[，,]", stripped) if piece.strip(" ,，:：-")]
+        clauses.extend(subparts)
+    return clauses
+
+
+def extract_member_phrase_candidates(text: str, max_candidates: int = 3) -> List[Dict[str, Any]]:
+    candidates: List[Dict[str, Any]] = []
+    seen = set()
+    for position, clause in enumerate(split_member_clauses(text)):
+        candidate = clean_member_theme(clause, limit=72)
+        normalized = normalize_phrase_for_match(candidate)
+        if not candidate or not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        if len(candidate) < 4:
+            continue
+        if looks_like_generic_phrase(candidate):
+            continue
+        candidates.append(
+            {
+                "phrase": candidate,
+                "normalized": normalized,
+                "tokens": phrase_token_set(candidate),
+                "position": position,
+            }
+        )
+        if len(candidates) >= max_candidates:
+            break
+    if candidates:
+        return candidates
+
+    fallback = clean_member_theme(text, limit=72)
+    normalized = normalize_phrase_for_match(fallback)
+    if fallback and normalized and not looks_like_generic_phrase(fallback):
+        return [{"phrase": fallback, "normalized": normalized, "tokens": phrase_token_set(fallback), "position": 0}]
+    return []
+
+
+def phrases_overlap(left: Dict[str, Any], right: Dict[str, Any]) -> bool:
+    left_norm = str(left.get("normalized") or "")
+    right_norm = str(right.get("normalized") or "")
+    if not left_norm or not right_norm:
+        return False
+    if left_norm == right_norm:
+        return True
+    shorter, longer = sorted([left_norm, right_norm], key=len)
+    if len(shorter) >= 8 and shorter in longer:
+        return True
+    left_tokens = set(left.get("tokens") or [])
+    right_tokens = set(right.get("tokens") or [])
+    if not left_tokens or not right_tokens:
+        return False
+    overlap = left_tokens & right_tokens
+    if len(overlap) < 2:
+        return False
+    union = left_tokens | right_tokens
+    return (len(overlap) / max(len(union), 1)) >= 0.5
+
+
+def choose_group_phrase(items: Sequence[Dict[str, Any]]) -> str:
+    ranked = sorted(
+        items,
+        key=lambda item: (
+            -int(item.get("support_count") or 0),
+            int(item.get("position") or 0),
+            abs(len(str(item.get("phrase") or "")) - 24),
+            len(str(item.get("phrase") or "")),
+        ),
+    )
+    return str(ranked[0].get("phrase") or "").strip() if ranked else ""
+
+
+def score_candidate_group(group: Dict[str, Any]) -> float:
+    phrase = str(group.get("phrase") or "")
+    support = len(set(group.get("member_indices") or []))
+    mentions = int(group.get("mentions") or 0)
+    avg_position = float(group.get("avg_position") or 0.0)
+    token_count = len(phrase_token_set(phrase))
+    length = len(phrase)
+    readability_bonus = 1.0 if 8 <= length <= 48 else 0.0
+    specificity_bonus = min(max(token_count - 1, 0), 4) * 0.6
+    position_bonus = max(0.0, 2.0 - avg_position * 0.5)
+    return support * 5.0 + mentions * 1.5 + readability_bonus + specificity_bonus + position_bonus
+
+
+def merge_candidate_groups(candidates: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    groups: List[Dict[str, Any]] = []
+    for candidate in candidates:
+        matched_group: Optional[Dict[str, Any]] = None
+        for group in groups:
+            probe = {
+                "normalized": group.get("normalized"),
+                "tokens": group.get("tokens"),
+            }
+            if phrases_overlap(candidate, probe):
+                matched_group = group
+                break
+        if matched_group is None:
+            groups.append(
+                {
+                    "normalized": candidate["normalized"],
+                    "tokens": set(candidate["tokens"]),
+                    "items": [candidate],
+                    "member_indices": {int(candidate["member_index"])},
+                    "mentions": 1,
+                }
+            )
+            continue
+        matched_group["items"].append(candidate)
+        matched_group["member_indices"].add(int(candidate["member_index"]))
+        matched_group["mentions"] = int(matched_group.get("mentions") or 0) + 1
+        matched_group["tokens"] = set(matched_group.get("tokens") or set()) | set(candidate["tokens"])
+
+    merged: List[Dict[str, Any]] = []
+    for group in groups:
+        items = list(group.get("items") or [])
+        chosen = choose_group_phrase(
+            [
+                {
+                    **item,
+                    "support_count": len(set(group.get("member_indices") or [])),
+                }
+                for item in items
+            ]
+        )
+        positions = [int(item.get("position") or 0) for item in items]
+        merged.append(
+            {
+                "phrase": chosen,
+                "normalized": normalize_phrase_for_match(chosen),
+                "tokens": phrase_token_set(chosen),
+                "member_indices": set(group.get("member_indices") or set()),
+                "mentions": int(group.get("mentions") or 0),
+                "avg_position": (sum(positions) / len(positions)) if positions else 0.0,
+            }
+        )
+    return merged
 
 
 def build_evidence_concepts(members: Sequence[Dict[str, Any]], limit: int = 4) -> List[str]:
-    concepts: List[str] = []
-    signature = build_cluster_keyword_signature(members)
-    if signature:
-        concepts.append(signature)
-    concepts.extend(
-        clean_member_theme(str(member.get("user") or ""))
-        for member in members
+    candidate_rows: List[Dict[str, Any]] = []
+    for member_index, member in enumerate(members):
+        for candidate in extract_member_phrase_candidates(str(member.get("user") or "")):
+            candidate_rows.append({**candidate, "member_index": member_index})
+
+    grouped = merge_candidate_groups(candidate_rows)
+    grouped = [group for group in grouped if group.get("phrase")]
+    grouped.sort(
+        key=lambda group: (
+            -score_candidate_group(group),
+            -len(set(group.get("member_indices") or [])),
+            str(group.get("phrase") or "").casefold(),
+        )
     )
-    concepts = unique_preserving_order(concepts)
-    return concepts[:limit]
+
+    selected: List[str] = []
+    selected_rows: List[Dict[str, Any]] = []
+    for group in grouped:
+        if any(phrases_overlap(group, existing) for existing in selected_rows):
+            continue
+        phrase = str(group.get("phrase") or "").strip()
+        if not phrase:
+            continue
+        selected.append(phrase)
+        selected_rows.append(group)
+        if len(selected) >= limit:
+            break
+
+    if selected:
+        return selected
+
+    return unique_preserving_order(clean_member_theme(str(member.get("user") or "")) for member in members if member.get("user"))[:limit]
 
 
 def extract_report_markdown(text: str, project_name: str) -> str:
