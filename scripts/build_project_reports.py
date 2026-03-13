@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -36,7 +37,6 @@ UNSAFE_FILENAME_RE = re.compile(r'[\\/:*?"<>|]+')
 DISALLOWED_FILENAME_CHAR_RE = re.compile(r"[^0-9A-Za-z_\-\u3400-\u4dbf\u4e00-\u9fff]+")
 UNDERSCORE_RUN_RE = re.compile(r"_+")
 MESSAGE_SECTION_RE = re.compile(r"^## (\d+)\. ([A-Za-z]+)\s*$", re.MULTILINE)
-EVIDENCE_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_+./-]{1,}|[\u3400-\u4dbf\u4e00-\u9fff]{2,}")
 REQUIRED_REPORT_HEADERS = [
     "## Project Overview",
     "## Core Themes",
@@ -526,11 +526,54 @@ Additional rules:
 - Prefer session-level understanding as the primary basis for the topic.
 - Treat recurring chunk evidence and repeated wording as supporting evidence, not the main topic source.
 
-Project: {project_name}
+        Project: {project_name}
 Conversation summaries:
 {chr(10).join(member_lines)}
 """
         return self._chat_json(prompt, max_tokens=1400, schema=schema)
+
+    def summarize_chunk_cluster(
+        self,
+        project_name: str,
+        session_topic_label: str,
+        members: Sequence[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        schema = """{
+  "label": "short evidence label",
+  "summary": "1-2 sentence chunk cluster summary",
+  "evidence_concepts": ["string"]
+}"""
+        member_lines = []
+        for item in members:
+            member_lines.append(
+                json.dumps(
+                    {
+                        "conversation_title": item.get("conversation_title"),
+                        "turn_id": item.get("turn_id"),
+                        "question": short_text(str(item.get("user") or ""), limit=220),
+                        "answer": short_text(str(item.get("assistant") or ""), limit=220),
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        prompt = f"""You are synthesizing one chunk-level evidence cluster for a project retrospective.
+
+Return one JSON object only.
+
+Rules:
+- Build one normalized subtopic label for the whole chunk cluster.
+- Treat these chunks as supporting evidence for a larger session topic, not as the main topic itself.
+- Prefer noun-phrase style labels and short technical phrasing.
+- Do not copy user requests verbatim unless a proper noun, formula name, or file name is genuinely the best label.
+- Evidence concepts should be short supporting labels, not conversational sentences.
+- Keep the output concrete and traceable.
+
+Project: {project_name}
+Owning session topic: {session_topic_label or "Unknown"}
+Chunk members:
+{chr(10).join(member_lines)}
+"""
+        return self._chat_json(prompt, max_tokens=900, schema=schema)
 
     def synthesize_project_knowledge(
         self,
@@ -799,6 +842,19 @@ def load_jsonl_cache(path: Path) -> Dict[str, Dict[str, Any]]:
     return cache
 
 
+def load_json_object_cache(path: Path) -> Dict[str, Dict[str, Any]]:
+    if not path.exists():
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        return {}
+    return {
+        str(key): value
+        for key, value in payload.items()
+        if isinstance(key, str) and isinstance(value, dict)
+    }
+
+
 def write_jsonl(path: Path, rows: Iterable[Dict[str, Any]]) -> None:
     ensure_parent(path)
     content = "\n".join(json.dumps(row, ensure_ascii=False) for row in rows)
@@ -843,295 +899,12 @@ def summarize_chunk_member_question(member: Dict[str, Any], limit: int = 90) -> 
     return short_text(str(member.get("user") or ""), limit=limit)
 
 
-def clean_member_theme(text: str, limit: int = 72) -> str:
-    value = text.strip()
-    if not value:
-        return ""
-    value = re.sub(r"https?://\S+", " ", value)
-    value = value.replace("🆕", " ").replace("🔄", " ")
-    value = re.sub(r"`[^`]+`", " ", value)
-    value = re.sub(r"\[[^\]]+\]\([^)]+\)", " ", value)
-    value = " ".join(value.split())
-    parts = re.split(r"[\n\r。！？!?;；]", value)
-    candidate = ""
-    for part in parts:
-        stripped = part.strip(" ,，:：-")
-        if len(stripped) >= 4:
-            candidate = stripped
-            break
-    if not candidate:
-        candidate = value
-    prefixes = [
-        "主要是",
-        "核心是",
-        "我在思考",
-        "我在想",
-        "我突然感覺到",
-        "我突然感覺",
-        "我注意到",
-        "我感覺",
-        "我想",
-        "我希望",
-        "我們重新回顧一下",
-        "我們重新回顧",
-        "我們回顧一下",
-        "New Session Continue",
-        "這些是放在",
-        "對了",
-        "可是",
-        "但是",
-        "因為",
-        "所以",
-        "那麼",
-        "然後",
-        "其實",
-        "只是",
-    ]
-    changed = True
-    while changed:
-        changed = False
-        for prefix in prefixes:
-            if candidate.startswith(prefix):
-                candidate = candidate[len(prefix) :].strip(" ,，:：-")
-                changed = True
-    candidate = re.sub(r"\s+", " ", candidate).strip(" ,，:：-")
-    return short_text(candidate, limit=limit)
-
-
-def normalize_phrase_for_match(text: str) -> str:
-    value = unicodedata.normalize("NFKC", text)
-    value = value.casefold()
-    value = re.sub(r"https?://\S+", " ", value)
-    value = re.sub(r"[`*_#>\[\]\(\)\"'“”‘’]", " ", value)
-    value = re.sub(r"[\s_/\\|+-]+", " ", value)
-    value = re.sub(r"[，。！？!?;；,:：]", " ", value)
-    value = " ".join(value.split())
-    return value.strip()
-
-
-def phrase_match_tokens(text: str) -> List[str]:
-    normalized = normalize_phrase_for_match(text)
-    return [token for token in EVIDENCE_TOKEN_RE.findall(normalized) if len(token.strip()) >= 2]
-
-
-def phrase_token_set(text: str) -> set[str]:
-    return set(phrase_match_tokens(text))
-
-
-def looks_like_generic_phrase(text: str) -> bool:
-    normalized = normalize_phrase_for_match(text)
-    if not normalized:
-        return True
-    generic_phrases = {
-        "我在思考",
-        "我在想",
-        "我希望",
-        "我感覺",
-        "這個系統",
-        "這個產品",
-        "這個項目",
-        "重新回顧",
-        "重新回顧一下",
-        "交互形式",
-        "單一入口完成任務",
-    }
-    if normalized in {item.casefold() for item in generic_phrases}:
-        return True
-    tokens = phrase_match_tokens(text)
-    if not tokens:
-        return True
-    return len(tokens) == 1 and len(tokens[0]) <= 2
-
-
-def split_member_clauses(text: str) -> List[str]:
-    cleaned = text.strip()
-    if not cleaned:
-        return []
-    cleaned = re.sub(r"https?://\S+", " ", cleaned)
-    cleaned = cleaned.replace("🆕", " ").replace("🔄", " ")
-    cleaned = re.sub(r"`[^`]+`", " ", cleaned)
-    cleaned = re.sub(r"\[[^\]]+\]\([^)]+\)", " ", cleaned)
-    cleaned = " ".join(cleaned.split())
-    raw_parts = re.split(r"[\n\r。！？!?;；]", cleaned)
-    clauses: List[str] = []
-    for part in raw_parts:
-        stripped = part.strip(" ,，:：-")
-        if not stripped:
-            continue
-        subparts = [stripped]
-        if len(stripped) > 40:
-            subparts = [piece.strip(" ,，:：-") for piece in re.split(r"[，,]", stripped) if piece.strip(" ,，:：-")]
-        clauses.extend(subparts)
-    return clauses
-
-
-def extract_member_phrase_candidates(text: str, max_candidates: int = 3) -> List[Dict[str, Any]]:
-    candidates: List[Dict[str, Any]] = []
-    seen = set()
-    for position, clause in enumerate(split_member_clauses(text)):
-        candidate = clean_member_theme(clause, limit=72)
-        normalized = normalize_phrase_for_match(candidate)
-        if not candidate or not normalized or normalized in seen:
-            continue
-        seen.add(normalized)
-        if len(candidate) < 4:
-            continue
-        if looks_like_generic_phrase(candidate):
-            continue
-        candidates.append(
-            {
-                "phrase": candidate,
-                "normalized": normalized,
-                "tokens": phrase_token_set(candidate),
-                "position": position,
-            }
-        )
-        if len(candidates) >= max_candidates:
-            break
-    if candidates:
-        return candidates
-
-    fallback = clean_member_theme(text, limit=72)
-    normalized = normalize_phrase_for_match(fallback)
-    if fallback and normalized and not looks_like_generic_phrase(fallback):
-        return [{"phrase": fallback, "normalized": normalized, "tokens": phrase_token_set(fallback), "position": 0}]
-    return []
-
-
-def phrases_overlap(left: Dict[str, Any], right: Dict[str, Any]) -> bool:
-    left_norm = str(left.get("normalized") or "")
-    right_norm = str(right.get("normalized") or "")
-    if not left_norm or not right_norm:
-        return False
-    if left_norm == right_norm:
-        return True
-    shorter, longer = sorted([left_norm, right_norm], key=len)
-    if len(shorter) >= 8 and shorter in longer:
-        return True
-    left_tokens = set(left.get("tokens") or [])
-    right_tokens = set(right.get("tokens") or [])
-    if not left_tokens or not right_tokens:
-        return False
-    overlap = left_tokens & right_tokens
-    if len(overlap) < 2:
-        return False
-    union = left_tokens | right_tokens
-    return (len(overlap) / max(len(union), 1)) >= 0.5
-
-
-def choose_group_phrase(items: Sequence[Dict[str, Any]]) -> str:
-    ranked = sorted(
-        items,
-        key=lambda item: (
-            -int(item.get("support_count") or 0),
-            int(item.get("position") or 0),
-            abs(len(str(item.get("phrase") or "")) - 24),
-            len(str(item.get("phrase") or "")),
-        ),
-    )
-    return str(ranked[0].get("phrase") or "").strip() if ranked else ""
-
-
-def score_candidate_group(group: Dict[str, Any]) -> float:
-    phrase = str(group.get("phrase") or "")
-    support = len(set(group.get("member_indices") or []))
-    mentions = int(group.get("mentions") or 0)
-    avg_position = float(group.get("avg_position") or 0.0)
-    token_count = len(phrase_token_set(phrase))
-    length = len(phrase)
-    readability_bonus = 1.0 if 8 <= length <= 48 else 0.0
-    specificity_bonus = min(max(token_count - 1, 0), 4) * 0.6
-    position_bonus = max(0.0, 2.0 - avg_position * 0.5)
-    return support * 5.0 + mentions * 1.5 + readability_bonus + specificity_bonus + position_bonus
-
-
-def merge_candidate_groups(candidates: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    groups: List[Dict[str, Any]] = []
-    for candidate in candidates:
-        matched_group: Optional[Dict[str, Any]] = None
-        for group in groups:
-            probe = {
-                "normalized": group.get("normalized"),
-                "tokens": group.get("tokens"),
-            }
-            if phrases_overlap(candidate, probe):
-                matched_group = group
-                break
-        if matched_group is None:
-            groups.append(
-                {
-                    "normalized": candidate["normalized"],
-                    "tokens": set(candidate["tokens"]),
-                    "items": [candidate],
-                    "member_indices": {int(candidate["member_index"])},
-                    "mentions": 1,
-                }
-            )
-            continue
-        matched_group["items"].append(candidate)
-        matched_group["member_indices"].add(int(candidate["member_index"]))
-        matched_group["mentions"] = int(matched_group.get("mentions") or 0) + 1
-        matched_group["tokens"] = set(matched_group.get("tokens") or set()) | set(candidate["tokens"])
-
-    merged: List[Dict[str, Any]] = []
-    for group in groups:
-        items = list(group.get("items") or [])
-        chosen = choose_group_phrase(
-            [
-                {
-                    **item,
-                    "support_count": len(set(group.get("member_indices") or [])),
-                }
-                for item in items
-            ]
-        )
-        positions = [int(item.get("position") or 0) for item in items]
-        merged.append(
-            {
-                "phrase": chosen,
-                "normalized": normalize_phrase_for_match(chosen),
-                "tokens": phrase_token_set(chosen),
-                "member_indices": set(group.get("member_indices") or set()),
-                "mentions": int(group.get("mentions") or 0),
-                "avg_position": (sum(positions) / len(positions)) if positions else 0.0,
-            }
-        )
-    return merged
-
-
 def build_evidence_concepts(members: Sequence[Dict[str, Any]], limit: int = 4) -> List[str]:
-    candidate_rows: List[Dict[str, Any]] = []
-    for member_index, member in enumerate(members):
-        for candidate in extract_member_phrase_candidates(str(member.get("user") or "")):
-            candidate_rows.append({**candidate, "member_index": member_index})
-
-    grouped = merge_candidate_groups(candidate_rows)
-    grouped = [group for group in grouped if group.get("phrase")]
-    grouped.sort(
-        key=lambda group: (
-            -score_candidate_group(group),
-            -len(set(group.get("member_indices") or [])),
-            str(group.get("phrase") or "").casefold(),
-        )
-    )
-
-    selected: List[str] = []
-    selected_rows: List[Dict[str, Any]] = []
-    for group in grouped:
-        if any(phrases_overlap(group, existing) for existing in selected_rows):
-            continue
-        phrase = str(group.get("phrase") or "").strip()
-        if not phrase:
-            continue
-        selected.append(phrase)
-        selected_rows.append(group)
-        if len(selected) >= limit:
-            break
-
-    if selected:
-        return selected
-
-    return unique_preserving_order(clean_member_theme(str(member.get("user") or "")) for member in members if member.get("user"))[:limit]
+    return unique_preserving_order(
+        summarize_chunk_member_question(member)
+        for member in members
+        if str(member.get("user") or "").strip()
+    )[:limit]
 
 
 def extract_report_markdown(text: str, project_name: str) -> str:
@@ -1540,12 +1313,30 @@ def build_attachment_confidence(vote_count: int, total_count: int, similarity: f
     return "low"
 
 
+def chunk_cluster_cache_key(members: Sequence[Dict[str, Any]]) -> str:
+    identifiers = []
+    for member in members:
+        chunk_id = str(member.get("chunk_id") or "").strip()
+        if chunk_id:
+            identifiers.append(chunk_id)
+            continue
+        identifiers.append(
+            f"{member.get('conversation_id') or ''}:{member.get('turn_id') or ''}:{member.get('source_path') or ''}"
+        )
+    digest = hashlib.sha1("||".join(sorted(identifiers)).encode("utf-8")).hexdigest()
+    return digest
+
+
 def build_chunk_cluster_artifacts(
+    project_name: str,
     chunks: Sequence[Dict[str, Any]],
     chunk_clusters: Sequence[Dict[str, Any]],
     conversation_to_session_cluster: Dict[str, str],
     session_cluster_centroids: Dict[str, Sequence[float]],
-) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    session_cluster_labels: Dict[str, str],
+    client: Optional[LocalModelClient],
+    summary_cache: Dict[str, Dict[str, Any]],
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
     cluster_dump: List[Dict[str, Any]] = []
     attachment_dump: List[Dict[str, Any]] = []
 
@@ -1562,6 +1353,7 @@ def build_chunk_cluster_artifacts(
         assigned_session_cluster: Optional[str] = None
         centroid_similarity: Optional[float] = None
         confidence = "unassigned"
+        session_topic_label = ""
 
         if votes:
             top_vote = max(votes.values())
@@ -1580,6 +1372,7 @@ def build_chunk_cluster_artifacts(
                 cluster["centroid"],
                 session_cluster_centroids.get(assigned_session_cluster, []),
             )
+            session_topic_label = session_cluster_labels.get(assigned_session_cluster, "")
             confidence = build_attachment_confidence(
                 vote_count=top_vote,
                 total_count=len(members),
@@ -1596,15 +1389,54 @@ def build_chunk_cluster_artifacts(
                 }
             )
 
+        cache_key = chunk_cluster_cache_key(members)
+        chunk_summary = summary_cache.get(cache_key)
+        if client is not None and not chunk_summary:
+            try:
+                chunk_summary = client.summarize_chunk_cluster(project_name, session_topic_label, members)
+            except PipelineError:
+                chunk_summary = None
+
+        fallback_evidence = build_evidence_concepts(members)
+        if not isinstance(chunk_summary, dict):
+            chunk_summary = {
+                "label": fallback_evidence[0] if fallback_evidence else f"Chunk Cluster {chunk_cluster_index}",
+                "summary": "",
+                "evidence_concepts": fallback_evidence,
+            }
+        else:
+            label = str(chunk_summary.get("label") or "").strip()
+            summary_text = str(chunk_summary.get("summary") or "").strip()
+            evidence = [str(item).strip() for item in (chunk_summary.get("evidence_concepts") or []) if str(item).strip()]
+            if not label:
+                label = fallback_evidence[0] if fallback_evidence else f"Chunk Cluster {chunk_cluster_index}"
+            if not evidence:
+                evidence = fallback_evidence
+            chunk_summary = {
+                "label": label,
+                "summary": summary_text,
+                "evidence_concepts": evidence[:4],
+            }
+        summary_cache[cache_key] = {
+            "cache_key": cache_key,
+            "member_chunk_ids": [str(member.get("chunk_id") or "") for member in members],
+            "session_cluster_id": assigned_session_cluster,
+            "session_topic_label": session_topic_label,
+            **chunk_summary,
+        }
+
         cluster_dump.append(
             {
                 "chunk_cluster_id": chunk_cluster_id,
                 "member_count": len(members),
                 "session_cluster_id": assigned_session_cluster,
+                "session_topic_label": session_topic_label,
                 "source_vote": votes,
                 "centroid_similarity": round(centroid_similarity, 4) if centroid_similarity is not None else None,
                 "confidence": confidence,
-                "evidence_concepts": build_evidence_concepts(members),
+                "label": chunk_summary.get("label") or "",
+                "summary": chunk_summary.get("summary") or "",
+                "evidence_concepts": chunk_summary.get("evidence_concepts") or [],
                 "members": [
                     {
                         "chunk_id": member.get("chunk_id"),
@@ -1620,7 +1452,7 @@ def build_chunk_cluster_artifacts(
             }
         )
 
-    return cluster_dump, attachment_dump
+    return cluster_dump, attachment_dump, summary_cache
 
 
 def attach_chunk_evidence_to_session_clusters(
@@ -1657,6 +1489,8 @@ def attach_chunk_evidence_to_session_clusters(
                 "chunk_cluster_id": item.get("chunk_cluster_id"),
                 "member_count": item.get("member_count"),
                 "confidence": item.get("confidence"),
+                "label": item.get("label") or "",
+                "summary": item.get("summary") or "",
                 "evidence_concepts": item.get("evidence_concepts") or [],
             }
             for item in attached_chunks[:5]
@@ -1797,6 +1631,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
         ab_chunks_path = project_dir / "ab_chunks.jsonl"
         chunk_clusters_path = project_dir / "chunk_clusters.json"
         chunk_links_path = project_dir / "chunk_to_session_cluster_links.json"
+        chunk_cluster_summaries_path = project_dir / "chunk_cluster_summaries.json"
         project_knowledge_path = project_dir / "project_knowledge.json"
         timeline_path = project_dir / "timeline.json"
         report_path = project_dir / "project_report.md"
@@ -1900,6 +1735,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
 
         chunk_cluster_dump: List[Dict[str, Any]] = []
         chunk_attachment_dump: List[Dict[str, Any]] = []
+        chunk_cluster_summary_cache = {} if args.force else load_json_object_cache(chunk_cluster_summaries_path)
         if all_chunks:
             chunk_threshold = args.chunk_cluster_threshold if args.chunk_cluster_threshold is not None else args.cluster_threshold
             if client is None:
@@ -1908,17 +1744,27 @@ def run_pipeline(args: argparse.Namespace) -> int:
                 [truncate_for_summary(str(item.get("normalized_text") or ""), args.chunk_max_chars) for item in all_chunks]
             )
             chunk_clusters = cluster_summaries(all_chunks, chunk_vectors, chunk_threshold)
-            chunk_cluster_dump, chunk_attachment_dump = build_chunk_cluster_artifacts(
+            session_cluster_labels = {
+                str(item.get("session_cluster_id") or ""): str(item.get("label") or "")
+                for item in cluster_payloads
+                if str(item.get("session_cluster_id") or "")
+            }
+            chunk_cluster_dump, chunk_attachment_dump, chunk_cluster_summary_cache = build_chunk_cluster_artifacts(
+                project_name=project_name,
                 chunks=all_chunks,
                 chunk_clusters=chunk_clusters,
                 conversation_to_session_cluster=conversation_to_session_cluster,
                 session_cluster_centroids=session_cluster_centroids,
+                session_cluster_labels=session_cluster_labels,
+                client=client,
+                summary_cache=chunk_cluster_summary_cache,
             )
         cluster_payloads = attach_chunk_evidence_to_session_clusters(cluster_payloads, chunk_cluster_dump)
         cluster_dump = attach_chunk_evidence_to_session_clusters(cluster_dump, chunk_cluster_dump)
         write_json(session_clusters_path, cluster_dump)
         write_json(chunk_clusters_path, chunk_cluster_dump)
         write_json(chunk_links_path, chunk_attachment_dump)
+        write_json(chunk_cluster_summaries_path, chunk_cluster_summary_cache)
 
         if args.fallback_report_only:
             project_knowledge = build_fallback_project_knowledge(project_name, conversations, cluster_payloads)
