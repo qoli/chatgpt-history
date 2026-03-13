@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import json
 import math
 import os
@@ -36,6 +37,7 @@ UNSAFE_FILENAME_RE = re.compile(r'[\\/:*?"<>|]+')
 DISALLOWED_FILENAME_CHAR_RE = re.compile(r"[^0-9A-Za-z_\-\u3400-\u4dbf\u4e00-\u9fff]+")
 UNDERSCORE_RUN_RE = re.compile(r"_+")
 MESSAGE_SECTION_RE = re.compile(r"^## (\d+)\. ([A-Za-z]+)\s*$", re.MULTILINE)
+EVIDENCE_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_+./-]{1,}|[\u3400-\u4dbf\u4e00-\u9fff]{2,}")
 REQUIRED_REPORT_HEADERS = [
     "## Project Overview",
     "## Core Themes",
@@ -842,8 +844,233 @@ def summarize_chunk_member_question(member: Dict[str, Any], limit: int = 90) -> 
     return short_text(str(member.get("user") or ""), limit=limit)
 
 
+def normalize_evidence_token(token: str) -> str:
+    value = token.strip()
+    if not value:
+        return ""
+    if re.fullmatch(r"[A-Za-z0-9_+./-]+", value):
+        return value.casefold()
+    return value
+
+
+def is_useful_evidence_token(token: str) -> bool:
+    value = normalize_evidence_token(token)
+    if not value:
+        return False
+    if len(value) <= 1:
+        return False
+    if value.isdigit():
+        return False
+    if value.startswith("http"):
+        return False
+    stopwords = {
+        "assistant",
+        "user",
+        "question",
+        "answer",
+        "python",
+        "python3",
+        "json",
+        "system",
+        "project",
+        "projects",
+        "agent",
+        "agents",
+        "workflow",
+        "workspace",
+        "runtime",
+        "using",
+        "based",
+        "design",
+        "model",
+        "models",
+        "environment",
+        "operating",
+        "architecture",
+        "automation",
+        "session",
+        "continue",
+        "new",
+        "with",
+        "from",
+        "into",
+        "over",
+        "under",
+        "layer",
+        "layers",
+        "core",
+        "mini",
+        "apps",
+        "app",
+        "bot",
+        "chat",
+        "interface",
+        "terminal",
+        "ai",
+        "ui",
+        "tool",
+        "tools",
+        "coding",
+        "devops",
+        "這個",
+        "那個",
+        "主要",
+        "主要是",
+        "核心",
+        "核心是",
+        "因為",
+        "所以",
+        "但是",
+        "可是",
+        "然後",
+        "對了",
+        "如果",
+        "似乎",
+        "感覺",
+        "其實",
+        "只是",
+        "就是",
+        "我們",
+        "你們",
+        "他們",
+        "這樣",
+        "一個",
+        "一些",
+        "東西",
+        "事情",
+        "問題",
+        "想法",
+        "內容",
+        "方式",
+        "功能",
+        "用戶",
+        "客戶",
+        "工作",
+        "項目",
+        "資料",
+        "產品",
+        "工具",
+        "能力",
+        "體驗",
+        "設計",
+        "管理",
+        "實作",
+        "可以",
+        "需要",
+        "應該",
+        "因爲",
+    }
+    return value not in stopwords
+
+
+def extract_evidence_tokens(text: str) -> List[str]:
+    tokens: List[str] = []
+    for raw_token in EVIDENCE_TOKEN_RE.findall(text):
+        if not is_useful_evidence_token(raw_token):
+            continue
+        tokens.append(raw_token)
+    return tokens
+
+
+def clean_member_theme(text: str, limit: int = 72) -> str:
+    value = text.strip()
+    if not value:
+        return ""
+    value = re.sub(r"https?://\S+", " ", value)
+    value = value.replace("🆕", " ").replace("🔄", " ")
+    value = re.sub(r"`[^`]+`", " ", value)
+    value = re.sub(r"\[[^\]]+\]\([^)]+\)", " ", value)
+    value = " ".join(value.split())
+    parts = re.split(r"[\n\r。！？!?;；]", value)
+    candidate = ""
+    for part in parts:
+        stripped = part.strip(" ,，:：-")
+        if len(stripped) >= 4:
+            candidate = stripped
+            break
+    if not candidate:
+        candidate = value
+    prefixes = [
+        "主要是",
+        "核心是",
+        "我在思考",
+        "我在想",
+        "我突然感覺到",
+        "我突然感覺",
+        "我注意到",
+        "我感覺",
+        "我想",
+        "我希望",
+        "我們重新回顧一下",
+        "我們重新回顧",
+        "我們回顧一下",
+        "New Session Continue",
+        "這些是放在",
+        "對了",
+        "可是",
+        "但是",
+        "因為",
+        "所以",
+        "那麼",
+        "然後",
+        "其實",
+        "只是",
+    ]
+    changed = True
+    while changed:
+        changed = False
+        for prefix in prefixes:
+            if candidate.startswith(prefix):
+                candidate = candidate[len(prefix) :].strip(" ,，:：-")
+                changed = True
+    candidate = re.sub(r"\s+", " ", candidate).strip(" ,，:：-")
+    return short_text(candidate, limit=limit)
+
+
+def build_cluster_keyword_signature(members: Sequence[Dict[str, Any]]) -> str:
+    token_support: Counter[str] = Counter()
+    surface_forms: Dict[str, str] = {}
+    for member in members:
+        member_tokens = set()
+        source_text = str(member.get("user") or "")
+        for token in extract_evidence_tokens(source_text):
+            normalized = normalize_evidence_token(token)
+            if not normalized:
+                continue
+            member_tokens.add(normalized)
+            surface_forms.setdefault(normalized, token)
+        for normalized in member_tokens:
+            token_support[normalized] += 1
+
+    if not token_support:
+        return ""
+
+    min_support = 2 if len(members) >= 3 else 1
+    ranked = [
+        (normalized, support)
+        for normalized, support in token_support.items()
+        if support >= min_support
+    ]
+    ranked.sort(key=lambda item: (-item[1], -len(item[0]), item[0]))
+    selected = [surface_forms[normalized] for normalized, _support in ranked[:3]]
+    if len(selected) < 2 and ranked:
+        selected = [surface_forms[normalized] for normalized, _support in ranked[:2]]
+    if not selected:
+        return ""
+    return " / ".join(selected)
+
+
 def build_evidence_concepts(members: Sequence[Dict[str, Any]], limit: int = 4) -> List[str]:
-    return unique_preserving_order(summarize_chunk_member_question(member) for member in members)[:limit]
+    concepts: List[str] = []
+    signature = build_cluster_keyword_signature(members)
+    if signature:
+        concepts.append(signature)
+    concepts.extend(
+        clean_member_theme(str(member.get("user") or ""))
+        for member in members
+    )
+    concepts = unique_preserving_order(concepts)
+    return concepts[:limit]
 
 
 def extract_report_markdown(text: str, project_name: str) -> str:
