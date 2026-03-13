@@ -44,6 +44,7 @@ REQUIRED_REPORT_HEADERS = [
     "## Repeated Patterns",
     "## Open Questions",
 ]
+CHUNK_CLUSTER_SUMMARY_CACHE_VERSION = 2
 
 
 class PipelineError(RuntimeError):
@@ -855,6 +856,17 @@ def load_json_object_cache(path: Path) -> Dict[str, Dict[str, Any]]:
     }
 
 
+def sanitize_chunk_cluster_summary_cache(payload: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    sanitized: Dict[str, Dict[str, Any]] = {}
+    for key, value in payload.items():
+        if int(value.get("cache_version") or 0) != CHUNK_CLUSTER_SUMMARY_CACHE_VERSION:
+            continue
+        if str(value.get("synthesis_method") or "") != "llm":
+            continue
+        sanitized[key] = value
+    return sanitized
+
+
 def write_jsonl(path: Path, rows: Iterable[Dict[str, Any]]) -> None:
     ensure_parent(path)
     content = "\n".join(json.dumps(row, ensure_ascii=False) for row in rows)
@@ -893,18 +905,6 @@ def short_text(value: str, limit: int = 160) -> str:
     if len(compact) <= limit:
         return compact
     return compact[: max(limit - 3, 1)].rstrip() + "..."
-
-
-def summarize_chunk_member_question(member: Dict[str, Any], limit: int = 90) -> str:
-    return short_text(str(member.get("user") or ""), limit=limit)
-
-
-def build_evidence_concepts(members: Sequence[Dict[str, Any]], limit: int = 4) -> List[str]:
-    return unique_preserving_order(
-        summarize_chunk_member_question(member)
-        for member in members
-        if str(member.get("user") or "").strip()
-    )[:limit]
 
 
 def extract_report_markdown(text: str, project_name: str) -> str:
@@ -1397,28 +1397,28 @@ def build_chunk_cluster_artifacts(
             except PipelineError:
                 chunk_summary = None
 
-        fallback_evidence = build_evidence_concepts(members)
         if not isinstance(chunk_summary, dict):
             chunk_summary = {
-                "label": fallback_evidence[0] if fallback_evidence else f"Chunk Cluster {chunk_cluster_index}",
+                "label": f"Chunk Cluster {chunk_cluster_index}",
                 "summary": "",
-                "evidence_concepts": fallback_evidence,
+                "evidence_concepts": [],
+                "synthesis_method": "empty",
             }
         else:
             label = str(chunk_summary.get("label") or "").strip()
             summary_text = str(chunk_summary.get("summary") or "").strip()
             evidence = [str(item).strip() for item in (chunk_summary.get("evidence_concepts") or []) if str(item).strip()]
             if not label:
-                label = fallback_evidence[0] if fallback_evidence else f"Chunk Cluster {chunk_cluster_index}"
-            if not evidence:
-                evidence = fallback_evidence
+                label = f"Chunk Cluster {chunk_cluster_index}"
             chunk_summary = {
                 "label": label,
                 "summary": summary_text,
                 "evidence_concepts": evidence[:4],
+                "synthesis_method": "llm",
             }
         summary_cache[cache_key] = {
             "cache_key": cache_key,
+            "cache_version": CHUNK_CLUSTER_SUMMARY_CACHE_VERSION,
             "member_chunk_ids": [str(member.get("chunk_id") or "") for member in members],
             "session_cluster_id": assigned_session_cluster,
             "session_topic_label": session_topic_label,
@@ -1735,7 +1735,11 @@ def run_pipeline(args: argparse.Namespace) -> int:
 
         chunk_cluster_dump: List[Dict[str, Any]] = []
         chunk_attachment_dump: List[Dict[str, Any]] = []
-        chunk_cluster_summary_cache = {} if args.force else load_json_object_cache(chunk_cluster_summaries_path)
+        chunk_cluster_summary_cache = (
+            {}
+            if args.force
+            else sanitize_chunk_cluster_summary_cache(load_json_object_cache(chunk_cluster_summaries_path))
+        )
         if all_chunks:
             chunk_threshold = args.chunk_cluster_threshold if args.chunk_cluster_threshold is not None else args.cluster_threshold
             if client is None:
