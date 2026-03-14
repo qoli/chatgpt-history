@@ -657,6 +657,51 @@ Chunk members:
 """
         return self._chat_json(prompt, max_tokens=900, schema=schema)
 
+    def summarize_project_overview(
+        self,
+        project_name: str,
+        topic_payloads: Sequence[Dict[str, Any]],
+    ) -> str:
+        schema = """{
+  "project_overview": "2-4 sentence project overview"
+}"""
+        topic_lines = []
+        for item in topic_payloads:
+            topic_lines.append(
+                json.dumps(
+                    {
+                        "label": item.get("label"),
+                        "summary": item.get("summary"),
+                        "concepts": item.get("concepts", []),
+                        "architectural_ideas": item.get("architectural_ideas", []),
+                        "engineering_decisions": item.get("engineering_decisions", []),
+                        "recurring_patterns": item.get("recurring_patterns", []),
+                        "open_questions": item.get("open_questions", []),
+                        "representative_titles": item.get("representative_titles", []),
+                        "evidence_concepts": item.get("evidence_concepts", []),
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        prompt = f"""You are writing only the Project Overview section for a technical project report.
+
+Return one JSON object only.
+
+Rules:
+- Base the overview primarily on session-level topic summaries.
+- Describe the project itself, not the reporting or analysis pipeline.
+- Do not mention conversation counts, clustering, session-level analysis, chunk evidence, or transcript organization.
+- Do not describe the project as a tool for organizing conversations unless the topics clearly say that is the product itself.
+- Focus on product identity, system form, architectural direction, and the main technical or product tension.
+- Keep it concise, concrete, and retrospective in tone.
+
+Project: {project_name}
+Topic syntheses:
+{chr(10).join(topic_lines)}
+"""
+        payload = self._chat_json(prompt, max_tokens=500, schema=schema)
+        return str(payload.get("project_overview") or "").strip()
+
     def synthesize_project_knowledge(
         self,
         project_name: str,
@@ -664,7 +709,6 @@ Chunk members:
         topic_payloads: Sequence[Dict[str, Any]],
     ) -> Dict[str, Any]:
         schema = """{
-  "project_overview": "2-4 sentence project retrospective",
   "concepts": [
     {
       "name": "string",
@@ -731,7 +775,11 @@ Conversation count: {len(conversations)}
 Topic syntheses:
 {chr(10).join(topic_lines)}
 """
-        return self._chat_json(prompt, max_tokens=2200, schema=schema)
+        payload = self._chat_json(prompt, max_tokens=2200, schema=schema)
+        overview = self.summarize_project_overview(project_name, topic_payloads)
+        if overview:
+            payload["project_overview"] = overview
+        return payload
 
     def build_project_report(
         self,
@@ -1065,16 +1113,18 @@ def build_fallback_project_knowledge(
     project_name: str,
     conversations: Sequence[ConversationRecord],
     topic_payloads: Sequence[Dict[str, Any]],
+    project_overview: str = "",
 ) -> Dict[str, Any]:
     start_time = min((item.create_time for item in conversations if item.create_time), default="")
     end_time = max((item.update_time for item in conversations if item.update_time), default="")
-    topic_labels = ", ".join(str(item.get("label") or "Topic") for item in topic_payloads[:4])
-    project_overview = (
-        f"{project_name} 目前整理了 {len(conversations)} 篇對話，時間範圍約為 {start_time or 'unknown'} 到 {end_time or 'unknown'}。"
-        f" 本報告先以 session-level topics 為主，再用 turn-pair evidence 補充 recurring concepts。"
-    )
-    if topic_labels:
-        project_overview += f" 目前較明確的 topics 包括：{topic_labels}。"
+    if not project_overview:
+        topic_labels = ", ".join(str(item.get("label") or "Topic") for item in topic_payloads[:4])
+        project_overview = (
+            f"{project_name} 的對話時間範圍約為 {start_time or 'unknown'} 到 {end_time or 'unknown'}。"
+            f" 目前主要主題集中在產品定位、系統架構、核心技術決策與仍待收斂的設計問題。"
+        )
+        if topic_labels:
+            project_overview += f" 較明確的 topics 包括：{topic_labels}。"
 
     return {
         "project_overview": project_overview,
@@ -1947,15 +1997,35 @@ def run_pipeline(args: argparse.Namespace) -> int:
         write_json(chunk_links_path, chunk_attachment_dump)
         write_json(chunk_cluster_summaries_path, chunk_cluster_summary_cache)
 
+        project_overview = ""
+        if client is not None:
+            try:
+                project_overview = client.summarize_project_overview(project_name, cluster_payloads)
+            except PipelineError:
+                project_overview = ""
+
         if args.fallback_report_only:
-            project_knowledge = build_fallback_project_knowledge(project_name, analyzed_conversations, cluster_payloads)
+            project_knowledge = build_fallback_project_knowledge(
+                project_name,
+                analyzed_conversations,
+                cluster_payloads,
+                project_overview=project_overview,
+            )
         else:
             try:
                 if client is None:
                     raise PipelineError("LocalModelClient was not initialized.")
                 project_knowledge = client.synthesize_project_knowledge(project_name, analyzed_conversations, cluster_payloads)
             except PipelineError:
-                project_knowledge = build_fallback_project_knowledge(project_name, analyzed_conversations, cluster_payloads)
+                project_knowledge = build_fallback_project_knowledge(
+                    project_name,
+                    analyzed_conversations,
+                    cluster_payloads,
+                    project_overview=project_overview,
+                )
+            else:
+                if project_overview:
+                    project_knowledge["project_overview"] = project_overview
         write_json(project_knowledge_path, project_knowledge)
         timeline_entries = build_timeline_entries(project_knowledge, cluster_payloads)
         write_json(timeline_path, timeline_entries)
