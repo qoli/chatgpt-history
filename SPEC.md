@@ -40,12 +40,12 @@ Raw conversation files are read-only inputs. The pipeline does not modify them.
 
 ### Embedding API
 
-- Base URL: `http://ronnie-mac-studio.local:1234/v1`
+- Base URL: `CHATGPT_HISTORY_EMBEDDING_BASE_URL` or default `http://127.0.0.1:1234/v1`
 - Model: `text-embedding-qwen3-0.6b-text-embedding`
 
 ### LLM API
 
-- Base URL: `http://ronnie-mac-studio.local:1234/v1`
+- Base URL: `CHATGPT_HISTORY_LLM_BASE_URL` or default `http://127.0.0.1:1234/v1`
 - Model: `qwen3.5-122b-a10b-text-mlx`
 
 Implementation note:
@@ -304,28 +304,28 @@ The existing conversation index is maintained. The pipeline rebuilds `index.md` 
 ### Stable Full Rebuild for All Projects
 
 ```bash
-cd /Volumes/Data/Github/chatgpt-history
+cd <repo-root>
 python3 scripts/build_project_reports.py --fallback-report-only --sleep-seconds 0.05
 ```
 
 ### Rebuild Only Final Reports
 
 ```bash
-cd /Volumes/Data/Github/chatgpt-history
+cd <repo-root>
 python3 scripts/build_project_reports.py --report-only
 ```
 
 ### Force Full Regeneration
 
 ```bash
-cd /Volumes/Data/Github/chatgpt-history
+cd <repo-root>
 python3 scripts/build_project_reports.py --force --fallback-report-only --sleep-seconds 0.05
 ```
 
 ### Clean Rebuild
 
 ```bash
-cd /Volumes/Data/Github/chatgpt-history
+cd <repo-root>
 rm -rf browser_control/output/project_reports
 python3 scripts/build_project_reports.py --force --fallback-report-only --sleep-seconds 0.05
 ```
@@ -333,7 +333,7 @@ python3 scripts/build_project_reports.py --force --fallback-report-only --sleep-
 ### Rebuild One Project
 
 ```bash
-cd /Volumes/Data/Github/chatgpt-history
+cd <repo-root>
 python3 scripts/build_project_reports.py --project 'Nano Tower' --fallback-report-only --sleep-seconds 0.05
 python3 scripts/build_project_reports.py --project 'Nano Tower' --report-only
 ```

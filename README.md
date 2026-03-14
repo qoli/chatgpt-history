@@ -127,7 +127,7 @@ The operational pipeline still matters, but it is downstream of the main idea.
 Run the end-to-end refresh pipeline:
 
 ```bash
-cd /Volumes/Data/Github/chatgpt-history
+cd <repo-root>
 python3 scripts/run_chatgpt_refresh_pipeline.py --force-all
 ```
 
@@ -164,6 +164,11 @@ The repo expects these tools or services to already exist locally:
 - a reachable local embedding / LLM server for `build_project_reports.py`
 - `md-to-pdf`
 - `rclone` with `gdrive:` configured
+
+Optional environment variables:
+- `CHATGPT_HISTORY_EMBEDDING_BASE_URL`
+- `CHATGPT_HISTORY_LLM_BASE_URL`
+- `CHATGPT_HISTORY_LLM_API_KEY`
 
 ## Output Artifacts
 

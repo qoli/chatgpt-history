@@ -112,7 +112,7 @@ Important files:
 Use this when you want the latest documents for all projects without relying on the final LLM Markdown-writing step:
 
 ```bash
-cd /Volumes/Data/Github/chatgpt-history
+cd <repo-root>
 python3 scripts/build_project_reports.py --fallback-report-only --sleep-seconds 0.05
 ```
 
@@ -121,7 +121,7 @@ python3 scripts/build_project_reports.py --fallback-report-only --sleep-seconds 
 Use this when summaries, clusters, and structured knowledge already exist:
 
 ```bash
-cd /Volumes/Data/Github/chatgpt-history
+cd <repo-root>
 python3 scripts/build_project_reports.py --report-only
 ```
 
@@ -130,7 +130,7 @@ python3 scripts/build_project_reports.py --report-only
 Use this when you want to ignore cached session summaries:
 
 ```bash
-cd /Volumes/Data/Github/chatgpt-history
+cd <repo-root>
 python3 scripts/build_project_reports.py --force --fallback-report-only --sleep-seconds 0.05
 ```
 
@@ -139,7 +139,7 @@ python3 scripts/build_project_reports.py --force --fallback-report-only --sleep-
 Use this when you want a complete clean rebuild:
 
 ```bash
-cd /Volumes/Data/Github/chatgpt-history
+cd <repo-root>
 rm -rf browser_control/output/project_reports
 python3 scripts/build_project_reports.py --force --fallback-report-only --sleep-seconds 0.05
 ```

@@ -24,10 +24,31 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_INPUT_DIR = PROJECT_DIR / "browser_control" / "output" / "chatgpt_markdown"
 DEFAULT_OUTPUT_DIR = PROJECT_DIR / "browser_control" / "output" / "project_reports"
+DOTENV_PATH = PROJECT_DIR / ".env"
 
-EMBEDDING_BASE_URL = "http://ronnie-mac-studio.local:1234/v1"
+
+def load_dotenv(path: Path) -> None:
+    if not path.exists():
+        return
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not key or key in os.environ:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+            value = value[1:-1]
+        os.environ[key] = value
+
+
+load_dotenv(DOTENV_PATH)
+
+EMBEDDING_BASE_URL = os.environ.get("CHATGPT_HISTORY_EMBEDDING_BASE_URL", "http://127.0.0.1:1234/v1")
 EMBEDDING_MODEL = "text-embedding-qwen3-0.6b-text-embedding"
-LLM_BASE_URL = "http://ronnie-mac-studio.local:1234/v1"
+LLM_BASE_URL = os.environ.get("CHATGPT_HISTORY_LLM_BASE_URL", "http://127.0.0.1:1234/v1")
 LLM_MODEL = "qwen3.5-122b-a10b-text-mlx"
 LLM_API_KEY = os.environ.get("CHATGPT_HISTORY_LLM_API_KEY", "")
 
