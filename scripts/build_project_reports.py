@@ -44,7 +44,13 @@ REQUIRED_REPORT_HEADERS = [
     "## Repeated Patterns",
     "## Open Questions",
 ]
-CHUNK_CLUSTER_SUMMARY_CACHE_VERSION = 2
+CONVERSATION_ROLE_CLASSIFIER_VERSION = 1
+CHUNK_CLUSTER_SUMMARY_CACHE_VERSION = 3
+EXCLUDED_CONVERSATION_ROLES = {
+    "meta_documentation",
+    "report_quality_review",
+    "synthesis_pipeline_maintenance",
+}
 
 
 class PipelineError(RuntimeError):
@@ -477,6 +483,48 @@ Conversation transcript:
         summary["source_url"] = record.source_url
         return summary
 
+    def classify_conversation_role(self, summary: Dict[str, Any]) -> Dict[str, Any]:
+        schema = """{
+  "conversation_role": "product_knowledge",
+  "include_in_project_knowledge": true,
+  "reason": "short reason"
+}"""
+        prompt = f"""You are classifying one conversation for project knowledge synthesis.
+
+Return one JSON object only.
+
+Allowed conversation_role values:
+- product_knowledge
+- engineering_design
+- product_strategy
+- meta_documentation
+- report_quality_review
+- synthesis_pipeline_maintenance
+- other
+
+Rules:
+- Judge the conversation by its main purpose, not by isolated keywords.
+- A conversation that mentions SPEC, TODO, docs, or reports can still be included if it mainly advances the product itself.
+- Set include_in_project_knowledge to false only when the conversation is primarily about documentation maintenance, generated report review, or maintaining the synthesis pipeline itself.
+- Keep the reason short and concrete.
+
+Conversation summary payload:
+{json.dumps(
+    {
+        "project": summary.get("project"),
+        "title": summary.get("title"),
+        "summary": summary.get("summary"),
+        "key_points": summary.get("key_points", []),
+        "decisions": summary.get("decisions", []),
+        "open_questions": summary.get("open_questions", []),
+        "keywords": summary.get("keywords", []),
+        "category_guess": summary.get("category_guess"),
+    },
+    ensure_ascii=False,
+)}
+"""
+        return self._chat_json(prompt, max_tokens=400, schema=schema)
+
     def summarize_cluster(self, project_name: str, members: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         schema = """{
   "label": "short theme label",
@@ -542,7 +590,10 @@ Conversation summaries:
         schema = """{
   "label": "short evidence label",
   "summary": "1-2 sentence chunk cluster summary",
-  "evidence_concepts": ["string"]
+  "evidence_concepts": ["string"],
+  "evidence_role": "product_evidence",
+  "include_as_evidence": true,
+  "reason": "short reason"
 }"""
         member_lines = []
         for item in members:
@@ -568,6 +619,15 @@ Rules:
 - Do not copy user requests verbatim unless a proper noun, formula name, or file name is genuinely the best label.
 - Evidence concepts should be short supporting labels, not conversational sentences.
 - Keep the output concrete and traceable.
+- Judge by the cluster's main purpose, not by isolated keywords.
+- Set include_as_evidence to false when the cluster is mainly about reading or rewriting project docs, reviewing generated reports, or maintaining the synthesis pipeline rather than advancing product/project knowledge.
+
+Allowed evidence_role values:
+- product_evidence
+- meta_documentation
+- report_quality_review
+- synthesis_pipeline_maintenance
+- other
 
 Project: {project_name}
 Owning session topic: {session_topic_label or "Unknown"}
@@ -905,6 +965,35 @@ def short_text(value: str, limit: int = 160) -> str:
     if len(compact) <= limit:
         return compact
     return compact[: max(limit - 3, 1)].rstrip() + "..."
+
+
+def summary_needs_role_classification(summary: Dict[str, Any]) -> bool:
+    role = str(summary.get("conversation_role") or "").strip()
+    include_flag = summary.get("include_in_project_knowledge")
+    version = int(summary.get("role_classifier_version") or 0)
+    return not role or not isinstance(include_flag, bool) or version != CONVERSATION_ROLE_CLASSIFIER_VERSION
+
+
+def apply_role_classification(summary: Dict[str, Any], classification: Dict[str, Any]) -> Dict[str, Any]:
+    updated = dict(summary)
+    role = str(classification.get("conversation_role") or "").strip() or "other"
+    include_flag = classification.get("include_in_project_knowledge")
+    if not isinstance(include_flag, bool):
+        include_flag = role not in EXCLUDED_CONVERSATION_ROLES
+    if role in EXCLUDED_CONVERSATION_ROLES:
+        include_flag = False
+    updated["conversation_role"] = role
+    updated["include_in_project_knowledge"] = include_flag
+    updated["role_reason"] = str(classification.get("reason") or "").strip()
+    updated["role_classifier_version"] = CONVERSATION_ROLE_CLASSIFIER_VERSION
+    return updated
+
+
+def include_summary_in_project_knowledge(summary: Dict[str, Any]) -> bool:
+    include_flag = summary.get("include_in_project_knowledge")
+    if isinstance(include_flag, bool):
+        return include_flag
+    return str(summary.get("conversation_role") or "").strip() not in EXCLUDED_CONVERSATION_ROLES
 
 
 def extract_report_markdown(text: str, project_name: str) -> str:
@@ -1402,18 +1491,33 @@ def build_chunk_cluster_artifacts(
                 "label": f"Chunk Cluster {chunk_cluster_index}",
                 "summary": "",
                 "evidence_concepts": [],
+                "evidence_role": "other",
+                "include_as_evidence": False,
+                "reason": "chunk cluster synthesis unavailable",
                 "synthesis_method": "empty",
             }
         else:
             label = str(chunk_summary.get("label") or "").strip()
             summary_text = str(chunk_summary.get("summary") or "").strip()
             evidence = [str(item).strip() for item in (chunk_summary.get("evidence_concepts") or []) if str(item).strip()]
+            evidence_role = str(chunk_summary.get("evidence_role") or "").strip() or "other"
+            include_as_evidence = chunk_summary.get("include_as_evidence")
+            if not isinstance(include_as_evidence, bool):
+                include_as_evidence = evidence_role == "product_evidence"
+            if evidence_role in EXCLUDED_CONVERSATION_ROLES:
+                include_as_evidence = False
+            reason = str(chunk_summary.get("reason") or "").strip()
             if not label:
                 label = f"Chunk Cluster {chunk_cluster_index}"
+            if not include_as_evidence:
+                evidence = []
             chunk_summary = {
                 "label": label,
                 "summary": summary_text,
                 "evidence_concepts": evidence[:4],
+                "evidence_role": evidence_role,
+                "include_as_evidence": include_as_evidence,
+                "reason": reason,
                 "synthesis_method": "llm",
             }
         summary_cache[cache_key] = {
@@ -1437,6 +1541,9 @@ def build_chunk_cluster_artifacts(
                 "label": chunk_summary.get("label") or "",
                 "summary": chunk_summary.get("summary") or "",
                 "evidence_concepts": chunk_summary.get("evidence_concepts") or [],
+                "evidence_role": chunk_summary.get("evidence_role") or "other",
+                "include_as_evidence": bool(chunk_summary.get("include_as_evidence")),
+                "reason": chunk_summary.get("reason") or "",
                 "members": [
                     {
                         "chunk_id": member.get("chunk_id"),
@@ -1461,6 +1568,8 @@ def attach_chunk_evidence_to_session_clusters(
 ) -> List[Dict[str, Any]]:
     attached_by_session: Dict[str, List[Dict[str, Any]]] = {}
     for chunk_cluster in chunk_clusters:
+        if not bool(chunk_cluster.get("include_as_evidence")):
+            continue
         session_cluster_id = str(chunk_cluster.get("session_cluster_id") or "")
         if not session_cluster_id:
             continue
@@ -1492,6 +1601,7 @@ def attach_chunk_evidence_to_session_clusters(
                 "label": item.get("label") or "",
                 "summary": item.get("summary") or "",
                 "evidence_concepts": item.get("evidence_concepts") or [],
+                "evidence_role": item.get("evidence_role") or "other",
             }
             for item in attached_chunks[:5]
         ]
@@ -1626,6 +1736,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
         print(f"Project: {project_name}", file=sys.stderr)
         project_dir = output_dir / sanitize_filename(project_name)
         summaries_path = project_dir / "conversation_summaries.jsonl"
+        excluded_conversations_path = project_dir / "excluded_conversations.json"
         clusters_path = project_dir / "clusters.json"
         session_clusters_path = project_dir / "session_clusters.json"
         ab_chunks_path = project_dir / "ab_chunks.jsonl"
@@ -1664,26 +1775,71 @@ def run_pipeline(args: argparse.Namespace) -> int:
         summaries: List[Dict[str, Any]] = []
         for record in conversations:
             cached = cached_summaries.get(record.conversation_id)
+            summary_payload: Optional[Dict[str, Any]] = None
             if (
                 isinstance(cached, dict)
                 and cached.get("update_time") == record.update_time
                 and cached.get("source_path") == str(record.source_path.relative_to(PROJECT_DIR))
             ):
                 print(f"  summary-cache: {record.title}", file=sys.stderr)
-                summaries.append(cached)
-                continue
-            print(f"  summarize: {record.title}", file=sys.stderr)
-            if client is None:
-                raise PipelineError("LocalModelClient was not initialized.")
-            summary = client.summarize_conversation(record, args.summary_max_chars)
-            summaries.append(summary)
+                summary_payload = dict(cached)
+            else:
+                print(f"  summarize: {record.title}", file=sys.stderr)
+                if client is None:
+                    raise PipelineError("LocalModelClient was not initialized.")
+                summary_payload = client.summarize_conversation(record, args.summary_max_chars)
+            if summary_payload is None:
+                raise PipelineError(f"Conversation summary payload missing for {record.title}.")
+            if summary_needs_role_classification(summary_payload):
+                print(f"  role-classify: {record.title}", file=sys.stderr)
+                if client is None:
+                    raise PipelineError("LocalModelClient was not initialized.")
+                try:
+                    classification = client.classify_conversation_role(summary_payload)
+                except PipelineError:
+                    classification = {
+                        "conversation_role": "other",
+                        "include_in_project_knowledge": True,
+                        "reason": "role classification unavailable",
+                    }
+                summary_payload = apply_role_classification(summary_payload, classification)
+            summaries.append(summary_payload)
         write_jsonl(summaries_path, summaries)
 
-        texts = [embedding_text(summary) for summary in summaries]
-        if client is None:
-            raise PipelineError("LocalModelClient was not initialized.")
-        vectors = client.embedding_vectors(texts)
-        clusters = cluster_summaries(summaries, vectors, args.cluster_threshold)
+        included_summaries = [summary for summary in summaries if include_summary_in_project_knowledge(summary)]
+        excluded_summaries = [summary for summary in summaries if not include_summary_in_project_knowledge(summary)]
+        excluded_dump = [
+            {
+                "conversation_id": item.get("conversation_id"),
+                "title": item.get("title"),
+                "conversation_role": item.get("conversation_role"),
+                "include_in_project_knowledge": item.get("include_in_project_knowledge"),
+                "role_reason": item.get("role_reason"),
+                "update_time": item.get("update_time"),
+                "source_path": item.get("source_path"),
+            }
+            for item in excluded_summaries
+        ]
+        write_json(excluded_conversations_path, excluded_dump)
+        if excluded_dump:
+            print(f"  excluded-from-synthesis: {len(excluded_dump)}", file=sys.stderr)
+
+        included_conversation_ids = {
+            str(item.get("conversation_id") or "")
+            for item in included_summaries
+            if str(item.get("conversation_id") or "")
+        }
+        analyzed_conversations = [
+            record for record in conversations if not record.conversation_id or record.conversation_id in included_conversation_ids
+        ]
+
+        clusters: List[Dict[str, Any]] = []
+        if included_summaries:
+            texts = [embedding_text(summary) for summary in included_summaries]
+            if client is None:
+                raise PipelineError("LocalModelClient was not initialized.")
+            vectors = client.embedding_vectors(texts)
+            clusters = cluster_summaries(included_summaries, vectors, args.cluster_threshold)
 
         cluster_payloads: List[Dict[str, Any]] = []
         cluster_dump: List[Dict[str, Any]] = []
@@ -1691,7 +1847,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
         session_cluster_centroids: Dict[str, Sequence[float]] = {}
         for cluster_index, cluster in enumerate(clusters, start=1):
             session_cluster_id = f"session-cluster-{cluster_index:03d}"
-            member_summaries = [summaries[index] for index in cluster["member_indices"]]
+            member_summaries = [included_summaries[index] for index in cluster["member_indices"]]
             if client is None:
                 raise PipelineError("LocalModelClient was not initialized.")
             cluster_summary = client.summarize_cluster(project_name, member_summaries)
@@ -1729,7 +1885,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
         write_json(clusters_path, cluster_dump)
 
         all_chunks: List[Dict[str, Any]] = []
-        for record in conversations:
+        for record in analyzed_conversations:
             all_chunks.extend(build_ab_chunks(record))
         write_jsonl(ab_chunks_path, all_chunks)
 
@@ -1771,14 +1927,14 @@ def run_pipeline(args: argparse.Namespace) -> int:
         write_json(chunk_cluster_summaries_path, chunk_cluster_summary_cache)
 
         if args.fallback_report_only:
-            project_knowledge = build_fallback_project_knowledge(project_name, conversations, cluster_payloads)
+            project_knowledge = build_fallback_project_knowledge(project_name, analyzed_conversations, cluster_payloads)
         else:
             try:
                 if client is None:
                     raise PipelineError("LocalModelClient was not initialized.")
-                project_knowledge = client.synthesize_project_knowledge(project_name, conversations, cluster_payloads)
+                project_knowledge = client.synthesize_project_knowledge(project_name, analyzed_conversations, cluster_payloads)
             except PipelineError:
-                project_knowledge = build_fallback_project_knowledge(project_name, conversations, cluster_payloads)
+                project_knowledge = build_fallback_project_knowledge(project_name, analyzed_conversations, cluster_payloads)
         write_json(project_knowledge_path, project_knowledge)
         timeline_entries = build_timeline_entries(project_knowledge, cluster_payloads)
         write_json(timeline_path, timeline_entries)
