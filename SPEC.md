@@ -46,6 +46,8 @@ Raw conversation files are read-only inputs. The pipeline does not modify them.
 ### LLM API
 
 - Base URL: `CHATGPT_HISTORY_LLM_BASE_URL` or default `http://127.0.0.1:1234/v1`
+- Max context window: `CHATGPT_HISTORY_MAX_CONTEXT_WINDOW` or default `262144`
+- Token estimator encoding: `CHATGPT_HISTORY_TOKEN_ENCODING` or default `o200k_base`
 - Model: `qwen3.5-122b-a10b-text-mlx`
 
 Implementation note:

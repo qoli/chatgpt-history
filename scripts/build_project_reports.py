@@ -20,6 +20,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
+import tiktoken
+
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_INPUT_DIR = PROJECT_DIR / "browser_control" / "output" / "chatgpt_markdown"
@@ -46,11 +48,32 @@ def load_dotenv(path: Path) -> None:
 
 load_dotenv(DOTENV_PATH)
 
+
+def env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
 EMBEDDING_BASE_URL = os.environ.get("CHATGPT_HISTORY_EMBEDDING_BASE_URL", "http://127.0.0.1:1234/v1")
 EMBEDDING_MODEL = "text-embedding-qwen3-0.6b-text-embedding"
 LLM_BASE_URL = os.environ.get("CHATGPT_HISTORY_LLM_BASE_URL", "http://127.0.0.1:1234/v1")
 LLM_MODEL = "qwen3.5-122b-a10b-text-mlx"
 LLM_API_KEY = os.environ.get("CHATGPT_HISTORY_LLM_API_KEY", "")
+MAX_CONTEXT_WINDOW = env_int("CHATGPT_HISTORY_MAX_CONTEXT_WINDOW", 262144)
+SAFE_CONTEXT_WINDOW = max(1024, math.floor(MAX_CONTEXT_WINDOW * 0.96))
+TOKEN_ENCODING_NAME = os.environ.get("CHATGPT_HISTORY_TOKEN_ENCODING", "o200k_base")
+SUMMARY_MAX_OUTPUT_TOKENS = 1400
+SUMMARY_PROMPT_RESERVE_TOKENS = 4096
+TOKEN_ENCODER = tiktoken.get_encoding(TOKEN_ENCODING_NAME)
+DEFAULT_SUMMARY_MAX_INPUT_TOKENS = max(
+    1024,
+    SAFE_CONTEXT_WINDOW - SUMMARY_MAX_OUTPUT_TOKENS - SUMMARY_PROMPT_RESERVE_TOKENS,
+)
 
 FRONTMATTER_RE = re.compile(r"\A---\n(.*?)\n---\n\n?(.*)\Z", re.DOTALL)
 FIELD_RE = re.compile(r"^([A-Za-z0-9_]+):\s*(.+?)\s*$")
@@ -126,10 +149,10 @@ def parse_args() -> argparse.Namespace:
         help="Optional cosine similarity threshold for A/B chunk clustering. Defaults to --cluster-threshold.",
     )
     parser.add_argument(
-        "--summary-max-chars",
+        "--summary-max-input-tokens",
         type=int,
-        default=8000,
-        help="Maximum conversation body characters sent to the conversation summarizer.",
+        default=DEFAULT_SUMMARY_MAX_INPUT_TOKENS,
+        help="Maximum conversation body tokens sent to the conversation summarizer.",
     )
     parser.add_argument(
         "--chunk-max-chars",
@@ -250,12 +273,35 @@ def sorted_project_conversations(input_dir: Path, patterns: Sequence[str], limit
     return dict(sorted(projects.items(), key=lambda item: item[0].casefold()))
 
 
-def truncate_for_summary(text: str, max_chars: int) -> str:
-    if len(text) <= max_chars:
-        return text
-    head = text[: max_chars // 2]
-    tail = text[-max_chars // 2 :]
+def count_text_tokens(text: str) -> int:
+    value = str(text or "")
+    if not value:
+        return 0
+    return len(TOKEN_ENCODER.encode(value))
+
+
+def truncate_for_token_budget(text: str, max_tokens: int) -> str:
+    value = str(text or "")
+    if not value:
+        return ""
+    if max_tokens <= 0:
+        return ""
+    tokens = TOKEN_ENCODER.encode(value)
+    if len(tokens) <= max_tokens:
+        return value
+    if max_tokens <= 32:
+        return TOKEN_ENCODER.decode(tokens[:max_tokens])
+    head_tokens = max_tokens // 2
+    tail_tokens = max_tokens - head_tokens
+    head = TOKEN_ENCODER.decode(tokens[:head_tokens]).rstrip()
+    tail = TOKEN_ENCODER.decode(tokens[-tail_tokens:]).lstrip()
     return f"{head}\n\n[... truncated ...]\n\n{tail}"
+
+
+def truncate_for_summary(text: str, max_tokens: int) -> str:
+    if count_text_tokens(text) <= max_tokens:
+        return text
+    return truncate_for_token_budget(text, max_tokens)
 
 
 def truncate_inline_text(text: str, max_chars: int) -> str:
@@ -452,7 +498,7 @@ class LocalModelClient:
             return any(LocalModelClient._looks_like_placeholder(item) for item in value.values())
         return False
 
-    def summarize_conversation(self, record: ConversationRecord, max_chars: int) -> Dict[str, Any]:
+    def summarize_conversation(self, record: ConversationRecord, max_input_tokens: int) -> Dict[str, Any]:
         schema = """{
   "summary": "2-4 sentence summary",
   "key_points": ["string"],
@@ -492,9 +538,9 @@ Conversation create_time: {record.create_time}
 Conversation update_time: {record.update_time}
 
 Conversation transcript:
-{truncate_for_summary(record.body, max_chars)}
+{truncate_for_summary(record.body, max_input_tokens)}
 """
-        summary = self._chat_json(prompt, max_tokens=1400, schema=schema)
+        summary = self._chat_json(prompt, max_tokens=SUMMARY_MAX_OUTPUT_TOKENS, schema=schema)
         summary["conversation_id"] = record.conversation_id
         summary["title"] = record.title
         summary["project"] = record.project
@@ -1858,7 +1904,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
                 print(f"  summarize: {record.title}", file=sys.stderr)
                 if client is None:
                     raise PipelineError("LocalModelClient was not initialized.")
-                summary_payload = client.summarize_conversation(record, args.summary_max_chars)
+                summary_payload = client.summarize_conversation(record, args.summary_max_input_tokens)
             if summary_payload is None:
                 raise PipelineError(f"Conversation summary payload missing for {record.title}.")
             if summary_needs_role_classification(summary_payload):
