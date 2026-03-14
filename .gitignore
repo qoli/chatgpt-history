@@ -1,2 +1,4 @@
 browser_control/output/
-scripts/__pycache__/*
+.env
+.playwright-cli/
+**/__pycache__/
